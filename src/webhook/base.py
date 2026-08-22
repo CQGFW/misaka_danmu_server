@@ -7,13 +7,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from fastapi import Request
 from pydantic import BaseModel
 
-from .. import crud
-from ..config_manager import ConfigManager
-from ..task_manager import TaskManager
-from ..rate_limiter import RateLimiter
-from ..tasks import webhook_search_and_dispatch_task
-from ..scraper_manager import ScraperManager
-from ..metadata_manager import MetadataSourceManager
+from src.db import crud, ConfigManager
+from src.services import TaskManager, ScraperManager, MetadataSourceManager
+from src.rate_limiter import RateLimiter
+
+# 延迟导入，避免循环依赖
+def _get_webhook_search_and_dispatch_task():
+    from src.tasks import webhook_search_and_dispatch_task
+    return webhook_search_and_dispatch_task
 
 class WebhookPayload(BaseModel):
     """定义 Webhook 负载的通用结构。"""
@@ -25,7 +26,7 @@ class WebhookPayload(BaseModel):
 class BaseWebhook(ABC):
     """所有 Webhook 处理器的抽象基类。"""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], task_manager: TaskManager, scraper_manager: ScraperManager, rate_limiter: RateLimiter, metadata_manager: MetadataSourceManager, config_manager: ConfigManager, title_recognition_manager):
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], task_manager: TaskManager, scraper_manager: ScraperManager, rate_limiter: RateLimiter, metadata_manager: MetadataSourceManager, config_manager: ConfigManager, title_recognition_manager, ai_matcher_manager):
         self._session_factory = session_factory
         self.task_manager = task_manager
         self.scraper_manager = scraper_manager
@@ -33,6 +34,8 @@ class BaseWebhook(ABC):
         self.metadata_manager = metadata_manager
         self.config_manager = config_manager
         self.title_recognition_manager = title_recognition_manager
+        self.ai_matcher_manager = ai_matcher_manager
+        self.notification_service = None  # 由 main.py 注入
         self.logger = logging.getLogger(self.__class__.__name__)
 
     @abstractmethod
@@ -75,7 +78,25 @@ class BaseWebhook(ABC):
             delayed_enabled = (await self.config_manager.get("webhookDelayedImportEnabled", "false")).lower() == 'true'
             delay_hours_str = await self.config_manager.get("webhookDelayedImportHours", "24")
             delay_hours = int(delay_hours_str) if delay_hours_str.isdigit() else 24
-            
+
+            # 发射 webhook_triggered 通知事件
+            if self.notification_service:
+                try:
+                    await self.notification_service.emit_event("webhook_triggered", {
+                        "anime_title": payload.get("animeTitle", "未知"),
+                        "webhook_source": webhook_source,
+                        "task_title": task_title,
+                        "delayed": delayed_enabled,
+                        "delay_hours": delay_hours if delayed_enabled else 0,
+                        # 补充季/集/类型，供通知展示（否则只有作品名和来源）
+                        "season": payload.get("season"),
+                        "episode": payload.get("currentEpisodeIndex"),
+                        "media_type": payload.get("mediaType", ""),
+                        "year": payload.get("year"),
+                    })
+                except Exception as e:
+                    self.logger.error(f"发射 webhook_triggered 事件失败: {e}")
+
             if delayed_enabled:
                 # 延时导入开启：将任务存入数据库
                 await crud.create_webhook_task(
@@ -87,6 +108,7 @@ class BaseWebhook(ABC):
             else:
                 # 延时导入关闭：直接提交到 TaskManager
                 self.logger.info(f"Webhook 延时导入已关闭，正在立即执行任务 '{task_title}'...")
+                webhook_search_and_dispatch_task = _get_webhook_search_and_dispatch_task()
                 task_coro = lambda s, cb: webhook_search_and_dispatch_task(
                     webhookSource=webhook_source,
                     progress_callback=cb,
@@ -100,4 +122,8 @@ class BaseWebhook(ABC):
                     title_recognition_manager=self.title_recognition_manager,
                     **payload
                 )
-                await self.task_manager.submit_task(task_coro, task_title, unique_key=unique_key)
+                await self.task_manager.submit_task(
+                    task_coro, task_title, unique_key=unique_key,
+                    task_type="webhook_search",
+                    task_parameters={"webhookSource": webhook_source, **payload}
+                )

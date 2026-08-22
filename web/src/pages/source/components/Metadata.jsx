@@ -1,6 +1,7 @@
 import {
   Card,
   Form,
+  Input,
   List,
   Modal,
   Switch,
@@ -8,7 +9,7 @@ import {
   Tooltip,
   Tabs,
 } from 'antd'
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState } from 'react'
 import {
   getMetaData,
   getProviderConfig,
@@ -23,7 +24,6 @@ import { MyIcon } from '@/components/MyIcon'
 import {
   closestCorners,
   DndContext,
-  DragOverlay,
   MouseSensor,
   TouchSensor,
   useSensor,
@@ -35,17 +35,42 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
-import { ContainerOutlined } from '@ant-design/icons'
+import {
+  CheckCircleFilled,
+  CloseCircleFilled,
+  QuestionCircleFilled,
+  ExclamationCircleFilled,
+  MinusCircleFilled,
+} from '@ant-design/icons'
 import { useMessage } from '../../../MessageContext'
+import { useTranslation } from 'react-i18next'
 import {
   BangumiConfig,
   TMDBConfig,
   TVDBConfig,
   DoubanConfig,
-  ImdbConfig
+  ImdbConfig,
+  TraktConfig,
 } from './MetadataSourceConfig'
 
+const getStatusIcon = (statusCode) => {
+  switch (statusCode) {
+    case 'ok':
+      return <CheckCircleFilled style={{ color: 'var(--color-green-400)', fontSize: 16 }} />
+    case 'warning':
+      return <ExclamationCircleFilled style={{ color: 'var(--color-orange-400)', fontSize: 16 }} />
+    case 'error':
+      return <CloseCircleFilled style={{ color: 'var(--color-red-400)', fontSize: 16 }} />
+    case 'disabled':
+      return <MinusCircleFilled style={{ color: 'var(--color-gray-400)', fontSize: 16 }} />
+    case 'unconfigured':
+    default:
+      return <QuestionCircleFilled style={{ color: 'var(--color-gray-400)', fontSize: 16 }} />
+  }
+}
+
 const SortableItem = ({ item, index, handleChangeStatus, onConfig }) => {
+  const { t } = useTranslation()
   const {
     attributes,
     listeners,
@@ -72,46 +97,47 @@ const SortableItem = ({ item, index, handleChangeStatus, onConfig }) => {
   }
 
   return (
-    <List.Item ref={setNodeRef} style={style}>
-      {/* 保留你原有的列表项渲染逻辑 */}
-      <div className="w-full flex items-center justify-between">
-        {/* 左侧添加拖拽手柄 */}
+    <List.Item ref={setNodeRef} style={style} className="!border-0 !p-0 mb-3">
+      <div
+        {...attributes}
+        {...listeners}
+        // why: 加 metadata-sortable-item 类名，让壁纸/毛玻璃主题可用 !important 覆盖 inline style 实色背景
+        className="metadata-sortable-item w-full rounded-xl border px-4 py-3 flex items-center justify-between transition-all hover:shadow-md"
+        style={{ background: 'var(--color-card)', borderColor: 'var(--color-border)', cursor: isDragging ? 'grabbing' : 'grab' }}
+      >
         <div className="flex items-center gap-2">
-          {/* 将attributes移到拖拽图标容器上，确保只有拖拽图标可触发拖拽 */}
-          <div {...attributes} {...listeners} style={{ cursor: 'grab' }}>
+          <div style={{ cursor: 'grab' }}>
             <MyIcon icon="drag" size={24} />
           </div>
           <div>{item.providerName}</div>
         </div>
-        <div className="flex items-center justify-around gap-3">
-          {/* 新增：配置按钮 */}
+        <div
+          className="flex items-center justify-around gap-3"
+          onPointerDown={e => e.stopPropagation()}
+          onMouseDown={e => e.stopPropagation()}
+          onTouchStart={e => e.stopPropagation()}
+        >
+          {/* 状态图标：移到齿轮左边，hover 显示详细状态 */}
+          <Tooltip title={item.status || t('metadata.notConfigured')} trigger={['click', 'hover']}>
+            <span className="cursor-default">{getStatusIcon(item.statusCode)}</span>
+          </Tooltip>
+          {/* 配置按钮 */}
           <div onClick={onConfig} className="cursor-pointer">
             <MyIcon icon="setting" size={24} />
           </div>
-          {item.status !== '未配置' && (
-            <Tooltip title={item.status} trigger={['click', 'hover']}>
-              <ContainerOutlined
-                style={{
-                  color: item.status?.includes('失败')
-                    ? 'var(--color-red-400)'
-                    : 'var(--color-green-400)',
-                }}
-              />
-            </Tooltip>
-          )}
-          {item.isAuxSearchEnabled ? (
-            <Tag color="green">已启用</Tag>
-          ) : (
-            <Tag color="red">未启用</Tag>
-          )}
           {item.providerName !== 'tmdb' ? (
-            <Tooltip title="切换启用状态">
-              <div onClick={handleChangeStatus}>
-                <MyIcon icon="exchange" size={24} />
-              </div>
-            </Tooltip>
+            <Switch
+              checked={item.isAuxSearchEnabled}
+              checkedChildren={t('metadata.enabled')}
+              unCheckedChildren={t('metadata.notEnabled')}
+              onChange={handleChangeStatus}
+            />
           ) : (
-            <div className="w-6"></div>
+            <Switch
+              checked
+              checkedChildren={t('metadata.enabled')}
+              disabled
+            />
           )}
         </div>
       </div>
@@ -120,14 +146,15 @@ const SortableItem = ({ item, index, handleChangeStatus, onConfig }) => {
 }
 
 export const Metadata = () => {
+  const { t } = useTranslation()
   const [loading, setLoading] = useState(true)
   const [list, setList] = useState([])
   const [activeItem, setActiveItem] = useState(null)
-  const dragOverlayRef = useRef(null)
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [selectedSource, setSelectedSource] = useState(null)
   const [form] = Form.useForm()
   const [confirmLoading, setConfirmLoading] = useState(false)
+  const [configData, setConfigData] = useState(null)
 
   const messageApi = useMessage()
 
@@ -162,8 +189,10 @@ export const Metadata = () => {
     if (isModalOpen && selectedSource?.providerName) {
       // 重置表单以防显示旧数据
       form.resetFields()
+      setConfigData(null)
       getProviderConfig({ providerName: selectedSource.providerName })
         .then(res => {
+          setConfigData(res.data)
           const formValues = {
             ...res.data,
             useProxy: res.data.useProxy ?? true,
@@ -179,7 +208,7 @@ export const Metadata = () => {
           form.setFieldsValue(formValues)
         })
         .catch(() => {
-          messageApi.error('获取配置失败')
+          messageApi.error(t('metadata.getConfigFailed'))
         })
     }
   }, [isModalOpen, selectedSource, form, messageApi])
@@ -223,7 +252,7 @@ export const Metadata = () => {
       }))
       setMetaData(payload)
       messageApi.success(
-        `已更新排序，${movedItem.providerName} 移动到位置 ${overIndex + 1}`
+        t('metadata.sortUpdated', { name: movedItem.providerName, position: overIndex + 1 })
       )
     }
 
@@ -263,12 +292,21 @@ export const Metadata = () => {
       setConfirmLoading(true)
       const values = await form.validateFields()
 
-      // 保存通用配置
+      // 收集动态字段（来自 configurableFields）
+      const dynamicPayload = {}
+      if (configData?.configurableFields) {
+        for (const key of Object.keys(configData.configurableFields)) {
+          if (values[key] !== undefined) {
+            dynamicPayload[key] = values[key]
+          }
+        }
+      }
+
+      // 保存通用配置 + 动态字段（一次请求）
       await setProviderConfig(selectedSource.providerName, {
         useProxy: values.useProxy,
         logRawResponses: values.logRawResponses,
-        forceAuxSearchEnabled: values.forceAuxSearchEnabled,
-        episodeUrlsEnabled: values.episodeUrlsEnabled,
+        ...dynamicPayload,
       })
 
       // 保存源特定配置
@@ -299,69 +337,26 @@ export const Metadata = () => {
           imdbUseApi: values.imdbUseApi ?? true,
           imdbEnableFallback: values.imdbEnableFallback ?? true,
         })
+      } else if (providerName === 'trakt') {
+        // Trakt OAuth 走内置 CF Worker，无需保存配置
       }
 
-      messageApi.success('保存成功')
+      messageApi.success(t('metadata.saveSuccess'))
       setIsModalOpen(false)
       // 成功后刷新列表以更新状态
       fetchInfo()
     } catch (error) {
-      messageApi.error(`保存失败: ${error.message || '未知错误'}`)
+      messageApi.error(`${t('metadata.saveFailed')}: ${error.message || t('metadata.unknownError')}`)
     } finally {
       setConfirmLoading(false)
     }
   }
 
-  const renderDragOverlay = () => {
-    if (!activeItem) return null
-
-    return (
-      <div ref={dragOverlayRef} style={{ width: '100%', maxWidth: '100%' }}>
-        <List.Item
-          style={{
-            boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15)',
-            opacity: 0.9,
-          }}
-        >
-          <div className="w-full flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <MyIcon icon="drag" size={24} />
-              <div>{activeItem.providerName}</div>
-            </div>
-            <div className="flex items-center justify-around gap-4">
-              {activeItem.status !== '未配置' && (
-                <Tooltip title={activeItem.status}>
-                  <ContainerOutlined
-                    style={{
-                      color: activeItem.status?.includes('失败')
-                        ? 'var(--color-red-400)'
-                        : 'var(--color-green-400)',
-                    }}
-                  />
-                </Tooltip>
-              )}
-              {activeItem.isAuxSearchEnabled ? (
-                <Tag color="green">已启用</Tag>
-              ) : (
-                <Tag color="red">未启用</Tag>
-              )}
-              {activeItem.providerName !== 'tmdb' ? (
-                <div>
-                  <MyIcon icon="exchange" size={24} />
-                </div>
-              ) : (
-                <div className="w-6"></div>
-              )}
-            </div>
-          </div>
-        </List.Item>
-      </div>
-    )
-  }
-
   return (
     <div className="my-6">
-      <Card loading={loading} title="元信息搜索源">
+      {/* why：加 scraper-panel-card 类名，与弹幕搜索源卡片（Scrapers.jsx）使用同一套
+          壁纸/玻璃主题强磨砂透明规则，保证两个标签页观感一致 */}
+      <Card loading={loading} title={t('metadata.metadataSearchSource')} className="scraper-panel-card">
         <DndContext
           sensors={sensors}
           collisionDetection={closestCorners}
@@ -391,12 +386,10 @@ export const Metadata = () => {
             />
           </SortableContext>
 
-          {/* 拖拽覆盖层 */}
-          <DragOverlay>{renderDragOverlay()}</DragOverlay>
         </DndContext>
       </Card>
       <Modal
-        title={`配置: ${selectedSource?.providerName}`}
+        title={t('metadata.configTitle', { name: selectedSource?.providerName })}
         open={isModalOpen}
         onOk={handleSaveSettings}
         onCancel={() => setIsModalOpen(false)}
@@ -415,83 +408,45 @@ export const Metadata = () => {
             items={[
               {
                 key: 'general',
-                label: '通用配置',
+                label: t('metadata.generalConfig'),
                 children: (
                   <div className="space-y-4">
                     <div className="my-4">
-                      请为 {selectedSource?.providerName} 源填写以下配置信息。
+                      {t('metadata.fillConfigTip', { name: selectedSource?.providerName })}
                     </div>
                     <div className="flex items-center justify-start flex-wrap gap-2 mb-4">
                       <Form.Item
                         name="useProxy"
-                        label="启用代理"
+                        label={t('metadata.useProxy')}
                         valuePropName="checked"
                         className="min-w-[100px] shrink-0 !mb-0"
                       >
                         <Switch />
                       </Form.Item>
                       <div className="w-full text-gray-500">
-                        启用后，此源的所有API请求将通过全局代理服务器进行。需要先在设置中配置全局代理。
+                        {t('metadata.useProxyTip')}
                       </div>
                     </div>
                     <div className="flex items-center justify-start flex-wrap md:flex-nowrap gap-2 mb-4">
                       <Form.Item
                         name="logRawResponses"
-                        label="记录原始响应"
+                        label={t('metadata.recordRawResponse')}
                         valuePropName="checked"
                         className="min-w-[100px] shrink-0 !mb-0"
                       >
                         <Switch />
                       </Form.Item>
                       <div className="w-full text-gray-500">
-                        启用后，此源的所有API请求的原始响应将被记录到{' '}
-                        <code>config/logs/metadata_responses.log</code> 文件中，用于调试。
+                        {t('metadata.rawResponseTipPrefix')}
+                        <code>config/logs/metadata_responses.log</code>{t('metadata.rawResponseTipSuffix')}
                       </div>
                     </div>
-                    {/* 修正：根据后端返回的 isFailoverSource 标志来决定是否显示此开关 */}
-                    {form.getFieldValue('isFailoverSource') && (
-                      <div className="flex items-center justify-start flex-wrap md:flex-nowrap gap-2 mb-4">
-                        <Form.Item
-                          name="forceAuxSearchEnabled"
-                          label="强制辅助搜索"
-                          valuePropName="checked"
-                          className="min-w-[100px] shrink-0 !mb-0"
-                        >
-                          <Switch />
-                        </Form.Item>
-                        <div
-                          className="w-full text-gray-500"
-                          title="启用后，在搜索时，此源将作为一个补充搜索源。如果其他弹幕源没有找到结果，或结果不佳，此源的结果将作为备选项显示在搜索结果中。"
-                        >
-                          启用后，此源将作为补充搜索源。当其他弹幕源结果不佳时，其结果将作为备选项显示。
-                        </div>
-                      </div>
-                    )}
-                    {/* 新增：根据后端返回的 supportsEpisodeUrls 标志来决定是否显示补充源开关 */}
-                    {form.getFieldValue('supportsEpisodeUrls') && (
-                      <div className="flex items-center justify-start flex-wrap md:flex-nowrap gap-2 mb-4">
-                        <Form.Item
-                          name="episodeUrlsEnabled"
-                          label="启用补充源"
-                          valuePropName="checked"
-                          className="min-w-[100px] shrink-0 !mb-0"
-                        >
-                          <Switch />
-                        </Form.Item>
-                        <div
-                          className="w-full text-gray-500"
-                          title="启用后，当弹幕源没有提供分集列表时，此元数据源可以提供分集URL作为补充。"
-                        >
-                          启用后，当弹幕源缺少分集列表时，此源可提供分集URL作为补充。
-                        </div>
-                      </div>
-                    )}
                   </div>
                 ),
               },
               {
                 key: 'source',
-                label: '源配置',
+                label: t('metadata.sourceConfig'),
                 children: (
                   <div className="py-4">
                     {selectedSource?.providerName === 'bangumi' && <BangumiConfig form={form} />}
@@ -499,9 +454,50 @@ export const Metadata = () => {
                     {selectedSource?.providerName === 'tvdb' && <TVDBConfig form={form} />}
                     {selectedSource?.providerName === 'douban' && <DoubanConfig form={form} />}
                     {selectedSource?.providerName === 'imdb' && <ImdbConfig form={form} />}
-                    {!['bangumi', 'tmdb', 'tvdb', 'douban', 'imdb'].includes(selectedSource?.providerName) && (
+                    {selectedSource?.providerName === 'trakt' && <TraktConfig form={form} />}
+                    {/* 动态渲染源声明的配置字段，避免每增加一个源都新增专属组件。 */}
+                    {configData?.configurableFields && Object.entries(configData.configurableFields).map(([key, fieldInfo]) => {
+                      const config = Array.isArray(fieldInfo)
+                        ? { label: fieldInfo[0], type: fieldInfo[1] || 'string', tooltip: fieldInfo[2] || '' }
+                        : { type: 'string', tooltip: '', required: false, ...fieldInfo }
+
+                      if (config.type === 'boolean') {
+                        return (
+                          <div key={key} className="flex items-center justify-start flex-wrap md:flex-nowrap gap-2 mb-4">
+                            <Form.Item
+                              name={key}
+                              label={config.label}
+                              valuePropName="checked"
+                              className="min-w-[100px] shrink-0 !mb-0"
+                            >
+                              <Switch />
+                            </Form.Item>
+                            {config.tooltip && <div className="w-full text-gray-500">{config.tooltip}</div>}
+                          </div>
+                        )
+                      }
+
+                      if (!['string', 'url', 'password'].includes(config.type)) return null
+                      const input = config.type === 'password'
+                        ? <Input.Password placeholder={config.placeholder} />
+                        : <Input type={config.type === 'url' ? 'url' : 'text'} placeholder={config.placeholder} />
+
+                      return (
+                        <Form.Item
+                          key={key}
+                          name={key}
+                          label={config.label}
+                          tooltip={config.tooltip}
+                          rules={config.required ? [{ required: true, message: `请输入${config.label || key}` }] : []}
+                        >
+                          {input}
+                        </Form.Item>
+                      )
+                    })}
+                    {!['bangumi', 'tmdb', 'tvdb', 'douban', 'imdb', 'trakt'].includes(selectedSource?.providerName)
+                      && !configData?.configurableFields && (
                       <div className="text-gray-500 text-center py-8">
-                        此源暂无特定配置项
+                        {t('metadata.noSpecificConfig')}
                       </div>
                     )}
                   </div>

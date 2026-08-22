@@ -9,13 +9,14 @@ from functools import wraps
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ..transport_manager import TransportManager
+from src.db import crud
+from src.db import models
+from src.core.cache import get_cache_backend
 
-from .. import crud
-from .. import models
+from src.utils import TransportManager
 
 if TYPE_CHECKING:
-    from ..config_manager import ConfigManager
+    from src.db import ConfigManager
 
 def _roman_to_int(s: str) -> int:
     """将罗马数字字符串转换为整数。"""
@@ -55,10 +56,13 @@ def get_season_from_title(title: str) -> int:
         (re.compile(r"([一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾])\s*之\s*章", re.I),
          lambda m: chinese_num_map.get(m.group(1))),
         # 格式: Unicode 罗马数字, e.g., Ⅲ
-        (re.compile(r"\s+([Ⅰ-Ⅻ])(?=\s|$)", re.I), 
+        (re.compile(r"\s+([Ⅰ-Ⅻ])(?=\s|$)", re.I),
          lambda m: {'Ⅰ': 1, 'Ⅱ': 2, 'Ⅲ': 3, 'Ⅳ': 4, 'Ⅴ': 5, 'Ⅵ': 6, 'Ⅶ': 7, 'Ⅷ': 8, 'Ⅸ': 9, 'Ⅹ': 10, 'Ⅺ': 11, 'Ⅻ': 12}.get(m.group(1).upper())),
         # 格式: ASCII 罗马数字, e.g., III
         (re.compile(r"\s+([IVXLCDM]+)\b", re.I), lambda m: _roman_to_int(m.group(1))),
+        # 格式: 标题末尾的阿拉伯数字, e.g., 刀剑神域2, 模范出租车3
+        # 匹配非数字字符后跟1-2位数字结尾，排除年份(4位数字)
+        (re.compile(r"[^\d](\d{1,2})\s*$"), lambda m: int(m.group(1)) if 1 <= int(m.group(1)) <= 20 else None),
     ]
 
     for pattern, handler in patterns:
@@ -76,47 +80,49 @@ def track_performance(func):
     """
     装饰器: 跟踪异步方法的执行时间,不影响并发性能。
     记录到 INFO 级别,方便查看性能统计。
+    使用任务ID作为键存储耗时，确保并发安全，供 scraper_manager 读取。
     """
     @wraps(func)
     async def wrapper(self, *args, **kwargs):
         start_time = time.perf_counter()
+        task_id = id(asyncio.current_task())  # 获取当前任务ID，确保并发安全
         try:
             result = await func(self, *args, **kwargs)
             elapsed = time.perf_counter() - start_time
+            elapsed_ms = elapsed * 1000
+            # 使用任务ID作为键存储耗时，确保并发安全
+            if not hasattr(self, '_task_timings'):
+                self._task_timings = {}
+            self._task_timings[task_id] = elapsed_ms
             # 记录到 INFO 级别,显示搜索源名称和耗时
             self.logger.info(f"[{self.provider_name}] {func.__name__} 耗时: {elapsed:.3f}s")
             return result
         except Exception as e:
             elapsed = time.perf_counter() - start_time
+            elapsed_ms = elapsed * 1000
+            # 即使失败也存储耗时
+            if not hasattr(self, '_task_timings'):
+                self._task_timings = {}
+            self._task_timings[task_id] = elapsed_ms
             self.logger.warning(f"[{self.provider_name}] {func.__name__} 失败耗时: {elapsed:.3f}s")
             raise
     return wrapper
+
+
+# 通用分集过滤规则（硬编码），用于前端"填充通用规则"按钮
+COMMON_EPISODE_BLACKLIST_REGEX = r'^(.*?)((.+?版)|(特(别|典))|((导|演)员|嘉宾|角色)访谈|福利|彩蛋|花絮|预告|特辑|专访|访谈|幕后|周边|资讯|看点|速看|回顾|盘点|合集|PV|MV|CM|OST|ED|OP|BD|特典|SP|NCOP|NCED|MENU|Web-DL|rip|x264|x265|aac|flac)(.*?)$'
 
 
 class BaseScraper(ABC):
     """
     所有搜索源的抽象基类。
     定义了搜索媒体、获取分集和获取弹幕的通用接口。
-    """
-    # 新增：全局搜索结果过滤规则，适用于所有源
-    _GLOBAL_SEARCH_JUNK_TITLE_PATTERN = re.compile(
-        r'纪录片|预告|花絮|专访|直拍|直播回顾|加更|走心|解忧|纯享|节点|解读|揭秘|赏析|速看|资讯|访谈|番外|短片|'
-        r'拍摄花絮|制作花絮|幕后花絮|未播花絮|独家花絮|花絮特辑|'
-        r'预告片|先导预告|终极预告|正式预告|官方预告|'
-        r'彩蛋片段|删减片段|未播片段|番外彩蛋|'
-        r'精彩片段|精彩看点|精彩回顾|精彩集锦|看点解析|看点预告|'
-        r'NG镜头|NG花絮|番外篇|番外特辑|'
-        r'制作特辑|拍摄特辑|幕后特辑|导演特辑|演员特辑|'
-        r'片尾曲|插曲|主题曲|背景音乐|OST|音乐MV|歌曲MV|'
-        r'前季回顾|剧情回顾|往期回顾|内容总结|剧情盘点|精选合集|剪辑合集|混剪视频|'
-        r'独家专访|演员访谈|导演访谈|主创访谈|媒体采访|发布会采访|'
-        r'抢先看|抢先版|试看版|即将上线',
-        re.IGNORECASE
-    )
 
-    # 新增：全局分集标题过滤规则的默认值
-    _GLOBAL_EPISODE_BLACKLIST_DEFAULT = r"^(.*?)((.+?版)|(特(别|典))|((导|演)员|嘉宾|角色)访谈|福利|彩蛋|花絮|预告|特辑|专访|访谈|幕后|周边|资讯|看点|速看|回顾|盘点|合集|PV|MV|CM|OST|ED|OP|BD|特典|SP|NCOP|NCED|MENU|Web-DL|rip|x264|x265|aac|flac)(.*?)$"
-    _PROVIDER_SPECIFIC_BLACKLIST_DEFAULT: str = ""
+    注意：分集过滤规则现在完全从 config 表读取，不再使用硬编码的默认值。
+    - 特定源分集黑名单：{provider_name}_episode_blacklist_regex
+    如果 config 表中键不存在，启动时会通过 register_defaults 创建并填充默认值。
+    如果键存在但值为空，则不进行过滤。
+    """
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession], config_manager: "ConfigManager", transport_manager: TransportManager):
         self._session_factory = session_factory
@@ -124,6 +130,8 @@ class BaseScraper(ABC):
         self.transport_manager = transport_manager
         self.logger = logging.getLogger(self.__class__.__name__)
         # 用于跟踪当前客户端实例所使用的代理配置
+        # 搜索超时（秒），由 scraper_manager 从 config 注入，默认15秒
+        self._search_timeout: float = 15.0
         self._current_proxy_config: Optional[str] = None
         # 缓存 scraper_manager 引用,用于访问预加载的 scraper 设置
         self._scraper_manager_ref: Optional[Any] = None
@@ -132,12 +140,28 @@ class BaseScraper(ABC):
         """
         获取当前 provider 的代理配置。
         优先使用预加载的缓存,避免重复数据库查询。
-        """
-        # config_manager 自带缓存,已预加载的配置会直接从内存返回
-        proxy_url = await self.config_manager.get("proxyUrl", "")
-        proxy_enabled_globally = (await self.config_manager.get("proxyEnabled", "false")).lower() == 'true'
 
-        if not proxy_enabled_globally or not proxy_url:
+        支持三种代理模式：
+        - none: 不使用代理
+        - http_socks: HTTP/SOCKS 代理
+        - accelerate: 加速代理（URL 重写模式，不返回代理 URL）
+        """
+        # 获取代理模式
+        proxy_mode = await self.config_manager.get("proxyMode", "none")
+
+        # 兼容旧配置：如果 proxyMode 为 none 但 proxyEnabled 为 true，则使用 http_socks 模式
+        if proxy_mode == "none":
+            proxy_enabled_globally = (await self.config_manager.get("proxyEnabled", "false")).lower() == 'true'
+            if proxy_enabled_globally:
+                proxy_mode = "http_socks"
+
+        # 如果代理模式为 none 或 accelerate，则不返回 HTTP 代理 URL
+        # accelerate 模式通过 URL 重写实现，不需要设置 httpx 的 proxy 参数
+        if proxy_mode != "http_socks":
+            return None
+
+        proxy_url = await self.config_manager.get("proxyUrl", "")
+        if not proxy_url:
             return None
 
         # 获取当前 provider 的代理设置
@@ -150,10 +174,65 @@ class BaseScraper(ABC):
             async with self._session_factory() as session:
                 scraper_settings = await crud.get_all_scraper_settings(session)
             provider_setting = next((s for s in scraper_settings if s['providerName'] == self.provider_name), None)
-        
+
         use_proxy_for_this_provider = provider_setting.get('useProxy', False) if provider_setting else False
 
         return proxy_url if use_proxy_for_this_provider else None
+
+    async def _should_use_accelerate_proxy(self) -> bool:
+        """检查是否应该使用加速代理模式"""
+        proxy_mode = await self.config_manager.get("proxyMode", "none")
+        return proxy_mode == "accelerate"
+
+    async def _get_accelerate_proxy_url(self) -> str:
+        """获取加速代理地址"""
+        return await self.config_manager.get("accelerateProxyUrl", "")
+
+    def _transform_url_for_accelerate(self, original_url: str, proxy_base: str) -> str:
+        """
+        转换 URL 为加速代理格式
+
+        原始: https://api.example.com/path
+        转换: https://proxy.vercel.app/https/api.example.com/path
+        """
+        if not proxy_base:
+            return original_url
+
+        proxy_base = proxy_base.rstrip('/')
+        protocol = "https" if original_url.startswith("https://") else "http"
+        target = original_url.replace(f"{protocol}://", "")
+
+        return f"{proxy_base}/{protocol}/{target}"
+
+    async def _transform_url_if_needed(self, url: str) -> str:
+        """
+        根据代理模式转换 URL
+
+        - none/http_socks: 返回原始 URL
+        - accelerate: 返回加速代理格式的 URL（如果当前 provider 启用了代理）
+        """
+        if not await self._should_use_accelerate_proxy():
+            return url
+
+        # 检查当前 provider 是否启用了代理
+        provider_setting = None
+        if self._scraper_manager_ref and hasattr(self._scraper_manager_ref, '_cached_scraper_settings'):
+            provider_setting = self._scraper_manager_ref._cached_scraper_settings.get(self.provider_name)
+        else:
+            async with self._session_factory() as session:
+                scraper_settings = await crud.get_all_scraper_settings(session)
+            provider_setting = next((s for s in scraper_settings if s['providerName'] == self.provider_name), None)
+
+        use_proxy_for_this_provider = provider_setting.get('useProxy', False) if provider_setting else False
+
+        if not use_proxy_for_this_provider:
+            return url
+
+        proxy_base = await self._get_accelerate_proxy_url()
+        if proxy_base:
+            return self._transform_url_for_accelerate(url, proxy_base)
+
+        return url
     
     async def _log_proxy_usage(self, proxy_url: Optional[str]):
         if proxy_url:
@@ -162,13 +241,17 @@ class BaseScraper(ABC):
     async def _create_client(self, **kwargs) -> httpx.AsyncClient: # type: ignore
         """
         创建 httpx.AsyncClient，并根据配置应用代理。
-        子类可以传递额外的 httpx.AsyncClient 参数。
+        超时统一由 _search_timeout 控制（由 scraper_manager 从 config 注入），
+        忽略子类传入的 timeout 参数。
         """
         proxy_to_use = await self._get_proxy_for_provider()
         await self._log_proxy_usage(proxy_to_use)
         self._current_proxy_config = proxy_to_use
 
-        client_kwargs = {"proxy": proxy_to_use, "timeout": 20.0, "follow_redirects": True, **kwargs}
+        # 忽略子类传的 timeout，统一用配置的 _search_timeout
+        kwargs.pop("timeout", None)
+
+        client_kwargs = {"proxy": proxy_to_use, "timeout": self._search_timeout, "follow_redirects": True, **kwargs}
         return httpx.AsyncClient(**client_kwargs)
 
     async def _get_from_cache(self, key: str) -> Optional[Any]:
@@ -192,6 +275,14 @@ class BaseScraper(ABC):
         self.logger.debug(f"{self.provider_name}: 缓存未预取，进行单独查询 - {key}")
         async with self._session_factory() as session:
             try:
+                _backend = get_cache_backend()
+                if _backend is not None:
+                    try:
+                        result = await _backend.get(key, region="default")
+                        if result is not None:
+                            return result
+                    except Exception:
+                        pass
                 return await crud.get_cache(session, key)
             finally:
                 await session.close()
@@ -203,13 +294,24 @@ class BaseScraper(ABC):
         if ttl > 0:
             async with self._session_factory() as session:
                 try:
-                    await crud.set_cache(session, key, value, ttl, provider=self.provider_name)
+                    _backend = get_cache_backend()
+                    if _backend is not None:
+                        try:
+                            await _backend.set(key, value, ttl=ttl, region="default")
+                        except Exception:
+                            await crud.set_cache(session, key, value, ttl, provider=self.provider_name)
+                    else:
+                        await crud.set_cache(session, key, value, ttl, provider=self.provider_name)
                     await session.commit()
                 finally:
                     await session.close()
 
     # 每个子类都必须覆盖这个类属性
     provider_name: str
+
+    # (可选) 子类可覆盖此属性，设置在UI上显示的友好名称。
+    # 如果未设置，前端将 fallback 到 provider_name。
+    display_name: Optional[str] = None
 
     # (可选) 子类可以覆盖此字典来声明其可配置的字段。
     # 格式: { "config_key": ("UI显示的标签", "字段类型", "UI上的提示信息") }
@@ -226,6 +328,9 @@ class BaseScraper(ABC):
     is_loggable: bool = True
 
     rate_limit_quota: Optional[int] = None # 新增：特定源的配额
+
+    # 点赞火焰阈值：l >= 此值显示 🔥，否则显示 ❤️（各源可在内部覆盖）
+    likes_fire_threshold: int = 1000
 
     def build_media_url(self, media_id: str) -> Optional[str]:
         """
@@ -253,39 +358,62 @@ class BaseScraper(ABC):
             return is_enabled_str
         return str(is_enabled_str).lower() == 'true'
 
-    async def get_episode_blacklist_pattern(self) -> Optional[re.Pattern]:
+    async def _log_raw_response(self, response_or_text, operation: str, **context):
         """
-        获取最终用于过滤分集标题的正则表达式对象。
-        它会合并全局黑名单和特定于提供商的黑名单。
+        统一的原始响应日志记录方法
+
+        Args:
+            response_or_text: httpx.Response 对象或原始响应文本
+            operation: 操作描述，如 "Search"、"Episodes"、"Danmaku"
+            **context: 额外的上下文信息，如 keyword、media_id、episode_id 等
         """
-        # 1. 获取全局黑名单，如果用户未配置，则使用内置默认值
-        global_pattern_str = await self.config_manager.get(
-            "episode_blacklist_regex",
-            self._GLOBAL_EPISODE_BLACKLIST_DEFAULT
+        if not await self._should_log_responses():
+            return
+
+        # 提取响应文本
+        if isinstance(response_or_text, str):
+            response_text = response_or_text
+        elif isinstance(response_or_text, bytes):
+            response_text = response_or_text.decode('utf-8', errors='ignore')
+        else:
+            # httpx.Response 对象
+            response_text = response_or_text.text
+
+        # 构建上下文信息字符串
+        context_parts = [f"{k}={v}" for k, v in context.items() if v is not None]
+        context_str = ", ".join(context_parts) if context_parts else ""
+
+        # 记录完整日志，不截断
+        logger = logging.getLogger("scraper_responses")
+        logger.debug(
+            f"{self.provider_name.upper()} {operation} Response "
+            f"({context_str}): {response_text}"
         )
 
-        # 2. 获取特定于提供商的黑名单
+    async def get_episode_blacklist_pattern(self) -> Optional[re.Pattern]:
+        """
+        获取用于过滤分集标题的正则表达式对象。
+        只使用特定于提供商的黑名单，不再有全局黑名单。
+
+        注意：此方法不使用硬编码的默认值作为兜底。
+        - 如果 config 表中键不存在，启动时会通过 register_defaults 创建并填充默认值
+        - 如果键存在但值为空，则不进行过滤
+        """
+        # 获取特定于提供商的黑名单
         provider_key = f"{self.provider_name}_episode_blacklist_regex"
-        # 注意：这里不提供默认值。如果数据库中没有（即用户从未保存过，且启动时也未注册上），
-        # 则返回 None，我们只使用全局黑名单。
-        provider_pattern_str = await self.config_manager.get(provider_key, None)
+        # 不提供默认值，如果数据库中没有则返回空字符串
+        provider_pattern_str = await self.config_manager.get(provider_key, "")
 
-        # 3. 合并两个正则表达式
-        final_patterns = []
-        if global_pattern_str and global_pattern_str.strip():
-            final_patterns.append(f"({global_pattern_str})")
-        
-        if provider_pattern_str and provider_pattern_str.strip():
-            final_patterns.append(f"({provider_pattern_str})")
+        # 打印实际读取到的过滤规则，便于排查
+        self.logger.info(f"读取到分集黑名单（正则）：{provider_pattern_str if provider_pattern_str else '(空)'}")
 
-        if not final_patterns:
+        if not provider_pattern_str or not provider_pattern_str.strip():
             return None
 
-        final_regex_str = "|".join(final_patterns)
         try:
-            return re.compile(final_regex_str, re.IGNORECASE)
+            return re.compile(provider_pattern_str, re.IGNORECASE)
         except re.error as e:
-            self.logger.error(f"编译分集黑名单正则表达式失败: '{final_regex_str}'. 错误: {e}")
+            self.logger.error(f"编译分集黑名单正则表达式失败: '{provider_pattern_str}'. 错误: {e}")
         return None
 
     async def execute_action(self, action_name: str, payload: Dict[str, Any]) -> Any:
@@ -304,6 +432,15 @@ class BaseScraper(ABC):
         episode_info: 可选字典，包含 'season' 和 'episode'。
         """
         raise NotImplementedError
+
+    def select_search_keywords(self, keywords: List[str]) -> List[str]:
+        """从候选关键词列表中挑选本源实际要搜索的关键词。
+
+        keywords 约定 keywords[0] 为主搜索词，其后为别名增强追加的多语言译名。
+        默认策略：只用主搜索词（避免用全量别名对每个源逐个网络搜索，既慢又易 0 结果）。
+        需要按语言挑别名的源（如 gamer 繁中站）覆写本方法叠加自身偏好。
+        """
+        return [keywords[0]] if keywords else []
 
     @abstractmethod
     async def get_info_from_url(self, url: str) -> Optional[models.ProviderSearchInfo]:
@@ -345,47 +482,185 @@ class BaseScraper(ABC):
         """
         return str(provider_episode_id)
 
-    def _filter_junk_episodes(self, episodes: List["models.ProviderEpisodeInfo"]) -> List["models.ProviderEpisodeInfo"]:
+    async def _filter_junk_episodes(
+        self,
+        episodes: List["models.ProviderEpisodeInfo"],
+        return_filtered: bool = False,
+    ):
         """
         过滤掉垃圾分集（预告、花絮等）
+
+        注意：此方法现在从 config 表读取过滤规则，不再使用硬编码的正则表达式。
+        如果 config 表中没有配置过滤规则，则不进行过滤。
+
+        Args:
+            episodes: 待过滤的分集列表
+            return_filtered: 是否同时返回被过滤的分集信息
+                - False（默认）: 返回 List[ProviderEpisodeInfo]（向后兼容）
+                - True: 返回 (保留的分集列表, 被过滤的分集列表[(episode, 匹配规则)])
         """
         if not episodes:
-            return episodes
-        
+            return (episodes, []) if return_filtered else episodes
+
+        # 从 config 表获取过滤规则，不使用硬编码兜底
+        blacklist_pattern = await self.get_episode_blacklist_pattern()
+
+        # 如果没有配置过滤规则，直接返回所有分集
+        if not blacklist_pattern:
+            return (episodes, []) if return_filtered else episodes
+
         filtered_episodes = []
         filtered_out_episodes = []
-        
+
         for episode in episodes:
-            # 检查是否匹配垃圾内容模式
-            match = self._GLOBAL_SEARCH_JUNK_TITLE_PATTERN.search(episode.title)
+            # 使用从 config 表获取的正则表达式进行过滤
+            match = blacklist_pattern.search(episode.title)
             if match:
-                junk_type = match.group(0)
+                # 优先取第2个捕获组（通常是关键词如"幕后""预告"），否则取整个匹配
+                junk_type = match.group(2) if match.lastindex and match.lastindex >= 2 else match.group(0)
                 filtered_out_episodes.append((episode, junk_type))
             else:
                 filtered_episodes.append(episode)
-        
-        # 打印分集过滤结果
-        self.logger.info(f"{self.provider_name}: 分集过滤结果:")
-        
-        # 打印过滤掉的分集
-        if filtered_out_episodes:
-            for episode, junk_type in filtered_out_episodes:
-                self.logger.info(f"  - 已过滤: {episode.title} (类型: {junk_type})")
-        
-        # 打印保留的分集
-        if filtered_episodes:
-            for episode in filtered_episodes:
-                # 检查是否包含预告关键词但未被过滤
-                title_lower = episode.title.lower()
-                if any(keyword in title_lower for keyword in ['预告', 'preview', 'trailer', 'teaser']):
-                    self.logger.info(f"  - {episode.title} (注意: 标题包含预告关键词但未被过滤)")
-                else:
-                    self.logger.info(f"  - {episode.title}")
-        
-        if not filtered_episodes and not filtered_out_episodes:
-            self.logger.info(f"  - 无分集数据")
-        
+
+        if return_filtered:
+            return filtered_episodes, filtered_out_episodes
         return filtered_episodes
+
+    def _log_episodes_result(
+        self,
+        kept_episodes: List["models.ProviderEpisodeInfo"],
+        filtered_out: List[Tuple["models.ProviderEpisodeInfo", str]],
+        elapsed_ms: int,
+        target_episode_index: Optional[int] = None,
+    ) -> None:
+        """
+        统一的分集获取结果日志，同时显示保留和被过滤的分集。
+
+        Args:
+            kept_episodes: 保留的分集列表
+            filtered_out: 被过滤的分集列表 [(episode, 匹配规则)]
+            elapsed_ms: 耗时（毫秒）
+            target_episode_index: 如果指定了目标集数，只显示该集
+        """
+        episodes_to_log = (
+            [ep for ep in kept_episodes if ep.episodeIndex == target_episode_index]
+            if target_episode_index is not None
+            else kept_episodes
+        )
+
+        log_lines = ["-", f"┌─── {self.provider_name} ({len(episodes_to_log)}个结果, {elapsed_ms}ms) ───"]
+        for ep in episodes_to_log:
+            log_lines.append(f"  - {ep.title}")
+
+        if filtered_out:
+            log_lines.append(f"  已过滤 {len(filtered_out)} 集:")
+            for ep, rule in filtered_out:
+                log_lines.append(f"    ✗ {ep.title} （黑名单正则匹配：{rule}）")
+
+        # 保留本次过滤明细，供编辑导入接口展示“不导入”列表；普通导入仍只使用 kept_episodes。
+        self._last_logged_filtered_out = list(filtered_out)
+
+        log_lines.append(f"└─── {self.provider_name} ───")
+        self.logger.info("\n".join(log_lines))
+
+    # ============ 可选订阅能力（订阅助手） ============
+    # 说明：以下属性/方法为「订阅助手」功能的可选扩展能力。
+    # 默认 supports_subscription=False，现有所有弹幕源无需改动即可保持原行为；
+    # 只有声明支持订阅的源（如 Bilibili）才覆盖这些属性/方法。
+    # 设计依据：docs/subscription_page_implementation_plan.md 第 5.4/5.5 节。
+    #
+    # 设计原则（与 search/get_episodes/get_comments 同款）：基类只定义统一的抽象方法签名，
+    # 源内部按 subscription_type 自行区分（如 Bilibili 的 UP主/系列/番剧）。
+
+    # 是否支持订阅助手；默认 False，避免影响现有源。
+    supports_subscription: bool = False
+
+    # 声明该源支持的订阅类型，由 /available-sources 读取。
+    # 每项形如：{"type": "bilibili_up", "label": "UP 主", "description": "...", "payloadSchema": {...}}
+    subscription_types: List[Dict[str, Any]] = []
+
+    async def check_subscription_capability(self, user=None) -> Dict[str, Any]:
+        """返回该源的订阅能力状态。
+
+        子类应覆盖此方法，返回是否可用、是否需要认证、认证状态、原因及支持的订阅类型。
+        默认实现表示「未实现订阅能力」，订阅助手不会展示该源。
+
+        :param user: 可选用户对象（OAuth 类源用它判断授权状态）。
+        """
+        return {
+            "available": False,
+            "authRequired": False,
+            "authStatus": "none",
+            "reason": "该源未实现订阅能力",
+            "subscriptionTypes": [],
+        }
+
+    async def discover_subscription_targets(self, query: str, subscription_type: str = "", user=None) -> List[Dict[str, Any]]:
+        """根据 query（关键词或 URL）发现可订阅目标候选，供前端列表挑选。
+
+        子类按 subscription_type 或 query 形态（关键词/URL）区分搜索逻辑。
+        返回统一结构列表，每项形如：
+        {type, title, cover, description, payload}
+        其中 payload 选中后直接喂给 validate_subscription_payload 创建订阅。
+
+        :param user: 可选用户对象（OAuth 类源用它取 token/api-key）。
+        """
+        raise NotImplementedError(f"{self.provider_name} 未实现 discover_subscription_targets")
+
+    async def fetch_subscription_calendar(self, category: str = "") -> List[Dict[str, Any]]:
+        """拉取该订阅源的「探索榜单」数据（如 Bilibili PGC 番剧/国创热门列表）。
+
+        与 discover 区别：discover 是「按用户输入搜」，本方法是「拉平台榜单」。
+        返回可写入 external_calendar_item 的标准条目列表（airWeekday 可为空 = 无播出日，
+        进探索发现海报网格而非日历）。子类在支持探索时覆盖。
+
+        :param category: 可选分类（如 'bangumi'/'guochuang'），空表示默认全部支持的分类。
+        """
+        raise NotImplementedError(f"{self.provider_name} 未实现 fetch_subscription_calendar")
+
+    async def validate_subscription_payload(self, subscription_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """校验并标准化订阅参数。
+
+        返回可写入 external_calendar_item 的标准结构：
+        {provider, externalId, title, animeType, subscriptionType, extraData}。
+        子类在支持订阅时覆盖此方法，并按 subscription_type 区分不同类型。
+        """
+        raise NotImplementedError(f"{self.provider_name} 未实现 validate_subscription_payload")
+
+    async def scan_subscription_target(self, target: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """扫描一个订阅目标，返回待写入 external_calendar_item 的候选项列表。
+
+        只负责发现候选项，不直接写库；写库由任务层统一调用 CRUD。
+        子类在支持订阅时覆盖此方法，并按 subscriptionType 区分不同类型。
+        """
+        raise NotImplementedError(f"{self.provider_name} 未实现 scan_subscription_target")
+
+    async def fetch_subscription_item_comments(self, item: Dict[str, Any]) -> List[dict]:
+        """对某个订阅候选项获取弹幕；默认委托给 get_comments。
+
+        item 至少包含定位弹幕所需的 episodeId/cid 等字段（存于 extraData）。
+        """
+        raise NotImplementedError(f"{self.provider_name} 未实现 fetch_subscription_item_comments")
+
+    async def resolve_url_structured(self, url: str, user: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+        """结构化解析一个 URL，返回「当前视频/所属合集/合集内全部视频」三段数据。
+
+        与 discover 区别：discover 是按关键词搜索榜单，本方法是针对具体 URL 拆出
+        可订阅的层级结构，供前端独立的 URL 解析弹框展示与多选批量订阅。
+
+        返回结构（子类覆盖时遵循）：
+        {
+            "currentVideo": {...},          # 当前 URL 指向的视频（含展示参数）
+            "collection": {...} | None,     # 所属合集/系列（如有）
+            "collectionVideos": [{...}],    # 合集内全部视频，供多选
+        }
+        默认返回 None 表示该源不支持结构化解析，调用方应降级到 discover。
+
+        :param url: 待解析的完整 URL。
+        :param user: 可选用户对象（OAuth 类源用它取 token/api-key）。
+        """
+        return None
+
 
     @abstractmethod
     async def close(self):

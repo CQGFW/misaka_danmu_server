@@ -2,24 +2,39 @@
 import asyncio
 import logging
 import traceback
-from typing import Callable, Optional, Dict, Any
+from typing import Callable, Optional, Dict, Any, TYPE_CHECKING
 from sqlalchemy.ext.asyncio import AsyncSession
 from thefuzz import fuzz
 
-from .. import crud, models
-from ..config_manager import ConfigManager
-from ..ai_matcher_manager import AIMatcherManager
-from ..scraper_manager import ScraperManager
-from ..metadata_manager import MetadataSourceManager
-from ..task_manager import TaskManager, TaskSuccess
-from ..rate_limiter import RateLimiter
-from ..title_recognition import TitleRecognitionManager
-from ..search_utils import unified_search
+from src.db import crud, models, ConfigManager
+from src.ai import AIMatcherManager
+from src.services import ScraperManager, MetadataSourceManager, TaskManager, TaskSuccess, TitleRecognitionManager
+from src.rate_limiter import RateLimiter
+from src.utils import (
+    ai_type_and_season_mapping_and_correction,
+    SearchTimer, SEARCH_TYPE_CONTROL_AUTO_IMPORT,
+    is_movie_by_title,
+)
+from src.utils.search_timer import SubStepTiming
+from src.utils.task_profiler import TaskProfiler, FLOW_AUTO_IMPORT
 
 logger = logging.getLogger(__name__)
 
 
+def _get_auto_import_media_type():
+    from src.api.control.models import AutoImportMediaType
+    return AutoImportMediaType
+
+
 # 延迟导入辅助函数
+def _get_unified_search():
+    from src.services.search import unified_search
+    return unified_search
+
+def _get_convert_to_chinese_title():
+    from src.services.name_converter import convert_to_chinese_title
+    return convert_to_chinese_title
+
 def _get_parse_episode_ranges():
     from .utils import parse_episode_ranges
     return parse_episode_ranges
@@ -53,6 +68,7 @@ async def auto_search_and_import_task(
     rate_limiter: Optional[RateLimiter] = None,
     api_key: Optional[str] = None,
     title_recognition_manager: Optional[TitleRecognitionManager] = None,
+    oauth_user: Optional[models.User] = None,
 ):
     """
     全自动搜索并导入的核心任务逻辑。
@@ -62,7 +78,22 @@ async def auto_search_and_import_task(
     _is_tmdb_reverse_lookup_enabled = _get_is_tmdb_reverse_lookup_enabled()
     _reverse_lookup_tmdb_chinese_title = _get_reverse_lookup_tmdb_chinese_title()
     generic_import_task = _get_generic_import_task()
-    
+
+    # 初始化搜索计时器（打日志）+ 性能统计 profiler（写 DB）
+    timer = SearchTimer(SEARCH_TYPE_CONTROL_AUTO_IMPORT, payload.searchTerm, logger)
+    timer.start()
+    profiler = TaskProfiler(FLOW_AUTO_IMPORT)
+
+    # 【性能优化】AI初始化预热：提前检查是否需要AI，如果需要则启动预热（不阻塞）
+    ai_matcher_warmup_task = None
+    try:
+        auto_import_tmdb_enabled_check = await config_manager.get("autoImportEnableTmdbSeasonMapping", "false")
+        if auto_import_tmdb_enabled_check.lower() == "true":
+            ai_matcher_warmup_task = asyncio.create_task(ai_matcher_manager.get_matcher())
+            logger.debug("全自动导入 AI匹配器预热已启动（并行）")
+    except Exception as e:
+        logger.warning(f"全自动导入 AI预热失败: {e}")
+
     try:
         # 防御性检查：确保 rate_limiter 已被正确传递。
         if rate_limiter is None:
@@ -83,8 +114,8 @@ async def auto_search_and_import_task(
         year: Optional[int] = None
         tmdb_id, bangumi_id, douban_id, tvdb_id, imdb_id = None, None, None, None, None
 
-        # 为后台任务创建一个虚拟用户对象
-        user = models.User(id=1, username="admin")
+        # 为后台任务创建用户上下文：优先使用提交订阅的真实用户，避免 Trakt/Bangumi OAuth 读取不到授权
+        user = oauth_user or models.User(id=1, username="admin")
 
         # 1. 获取元数据和别名
         details: Optional[models.MetadataDetailsResponse] = None
@@ -96,7 +127,7 @@ async def auto_search_and_import_task(
             effective_search_type = "tmdb"
 
         if effective_search_type != "keyword":
-            provider_media_type = None
+            timer.step_start("元数据查询")
             if media_type:
                 if effective_search_type == 'tmdb':
                     provider_media_type = 'tv' if media_type == 'tv_series' else 'movie'
@@ -136,6 +167,8 @@ async def auto_search_and_import_task(
                     logger.warning(f"尝试将关键词作为TMDB ID处理时出错，将按原样作为关键词处理。")
 
         if details:
+            _dur = timer.step_end(details=f"找到: {details.title}")
+            profiler.record_step("元数据查询", _dur)
             main_title = details.title or main_title
             image_url = details.imageUrl
             aliases.add(main_title)
@@ -175,7 +208,7 @@ async def auto_search_and_import_task(
                 else:
                     logger.info(f"TMDB反查功能未启用或不支持源 '{effective_search_type}'，继续使用原标题: '{main_title}'")
             if hasattr(details, 'type') and details.type:
-                media_type = models.AutoImportMediaType(details.type)
+                media_type = _get_auto_import_media_type()(details.type)
             if hasattr(details, 'year') and details.year:
                 year = details.year
 
@@ -188,6 +221,7 @@ async def auto_search_and_import_task(
         # 2. 检查媒体库中是否已存在
         existing_anime: Optional[Dict[str, Any]] = None
         await progress_callback(20, "正在检查媒体库...")
+        timer.step_start("媒体库检查")
 
         # 步骤 2a: 优先通过元数据ID和季度号进行精确查找
         if search_type != "keyword" and season is not None:
@@ -249,6 +283,8 @@ async def auto_search_and_import_task(
                 if all_exist:
                     final_message = f"作品 '{main_title}' 的所有请求集数 {requested_episodes} 已在媒体库中，无需重复导入。"
                     logger.info(f"自动导入任务检测到所有分集已存在，任务成功结束: {final_message}")
+                    profiler.record_step("媒体库检查", profiler.total_duration_ms)
+                    await profiler.flush(session)
                     raise TaskSuccess(final_message)
                 else:
                     logger.info(f"作品 '{main_title}' 已存在，但部分集数不存在: {missing_episodes}。将继续执行导入流程。")
@@ -258,6 +294,8 @@ async def auto_search_and_import_task(
         if payload.episode is None and existing_anime:
             final_message = f"作品 '{main_title}' 已在媒体库中，无需重复导入整季。"
             logger.info(f"自动导入任务检测到作品已存在（整季导入），任务成功结束: {final_message}")
+            profiler.record_step("媒体库检查", profiler.total_duration_ms)
+            await profiler.flush(session)
             raise TaskSuccess(final_message)
 
 
@@ -290,6 +328,8 @@ async def auto_search_and_import_task(
                 if payload.episode is None:
                     final_message = f"作品 '{main_title}' 已在媒体库中，无需重复导入。"
                     logger.info(f"自动导入任务检测到作品已存在（整季导入），任务成功结束: {final_message}")
+                    profiler.record_step("媒体库检查", profiler.total_duration_ms)
+                    await profiler.flush(session)
                     raise TaskSuccess(final_message)
                 else:
                     # 对于单集/多集导入，使用库内已有的源创建导入任务
@@ -319,7 +359,8 @@ async def auto_search_and_import_task(
                         title_recognition_manager=title_recognition_manager,
                         is_fallback=False,
                         preassignedAnimeId=anime_id_to_use,
-                        selectedEpisodes=selected_episodes
+                        selectedEpisodes=selected_episodes,
+                        enable_incremental_refresh=bool(payload.enableIncrementalRefresh),
                     )
 
                     # 构建任务标题
@@ -351,7 +392,8 @@ async def auto_search_and_import_task(
                         "tmdbId": tmdb_id,
                         "imdbId": imdb_id,
                         "tvdbId": tvdb_id,
-                        "bangumiId": bangumi_id
+                        "bangumiId": bangumi_id,
+                        "enableIncrementalRefresh": bool(payload.enableIncrementalRefresh),
                     }
 
                     execution_task_id, _ = await task_manager.submit_task(
@@ -362,9 +404,13 @@ async def auto_search_and_import_task(
                         task_parameters=task_parameters
                     )
                     final_message = f"已使用库内源创建导入任务。执行任务ID: {execution_task_id}"
+                    profiler.record_step("触发导入任务（库内源）", profiler.total_duration_ms)
+                    await profiler.flush(session)
                     raise TaskSuccess(final_message)
 
         # 3. 如果库中不存在，则进行全网搜索
+        _dur = timer.step_end(details=f"{'找到' if existing_anime else '未找到'}")
+        profiler.record_step("媒体库检查", _dur)
         await progress_callback(40, "媒体库未找到，开始全网搜索...")
         # 注意：搜索阶段不传递episode信息，因为scraper的search方法不需要具体集数
         # 集数信息只在导入阶段使用
@@ -384,7 +430,7 @@ async def auto_search_and_import_task(
                     logger.info("一个或多个元数据源已启用辅助搜索，开始执行...")
 
                     # 调用正确的方法
-                    supplemental_aliases, _ = await metadata_manager.search_supplemental_sources(main_title, user_model)
+                    supplemental_aliases, _, _, _ = await metadata_manager.search_supplemental_sources(main_title, user_model)
                     aliases.update(supplemental_aliases)
 
                     logger.info(f"所有辅助搜索完成，最终别名集大小: {len(aliases)}")
@@ -393,6 +439,21 @@ async def auto_search_and_import_task(
                     logger.warning("未找到admin用户，跳过元数据源辅助搜索")
             except Exception as e:
                 logger.warning(f"元数据源辅助搜索失败: {e}")
+
+        # 🚀 名称转换功能 - 检测非中文标题并尝试转换为中文（在预处理规则之前执行）
+        # 创建一个虚拟用户用于元数据调用
+        auto_import_user = oauth_user or models.User(id=0, username="auto_import")
+        convert_to_chinese_title = _get_convert_to_chinese_title()
+        converted_title, conversion_applied = await convert_to_chinese_title(
+            main_title,
+            config_manager,
+            metadata_manager,
+            ai_matcher_manager,
+            auto_import_user
+        )
+        if conversion_applied:
+            logger.info(f"✓ 全自动导入 名称转换: '{main_title}' → '{converted_title}'")
+            main_title = converted_title  # 更新 main_title 用于后续处理
 
         # 应用搜索预处理规则
         search_title = main_title
@@ -415,54 +476,48 @@ async def auto_search_and_import_task(
             else:
                 logger.info(f"○ 搜索预处理未生效: '{main_title}'")
 
-        # 创建季度映射任务(如果启用) - 与搜索并行运行
-        season_mapping_task = None
+        # 创建AI类型和季度映射任务(如果启用) - 与搜索并行运行
+        mapping_task = None
         auto_import_tmdb_enabled = await config_manager.get("autoImportEnableTmdbSeasonMapping", "false")
-        if auto_import_tmdb_enabled.lower() == "true" and media_type != "movie" and search_season and search_season > 1:
-            logger.info(f"○ 全自动导入 季度映射: 开始为 '{search_title}' S{search_season:02d} 获取季度名称(并行)...")
+        if auto_import_tmdb_enabled.lower() == "true" and media_type != "movie":
+            logger.info(f"○ 全自动导入 AI映射: 开始为 '{search_title}' 进行类型和季度映射(并行)...")
 
-            # 获取AI匹配器(如果启用)
-            ai_matcher = await ai_matcher_manager.get_matcher()
-            if ai_matcher:
-                logger.debug("全自动导入 季度映射: 使用AI匹配器")
+            # 获取AI匹配器(如果启用) - 【性能优化】使用预热的AI匹配器
+            ai_matcher = None
+            if ai_matcher_warmup_task:
+                ai_matcher = await ai_matcher_warmup_task
+                ai_matcher_warmup_task = None  # 清空task，避免重复await
             else:
-                logger.debug("全自动导入 季度映射: AI匹配器未启用或初始化失败")
-
-            # 获取元数据源和自定义提示词
-            metadata_source = await config_manager.get("seasonMappingMetadataSource", "tmdb")
-            custom_prompt = await config_manager.get("seasonMappingPrompt", "")
-            sources = [metadata_source] if metadata_source else None
+                ai_matcher = await ai_matcher_manager.get_matcher()
+            if ai_matcher:
+                logger.debug("全自动导入 AI映射: 使用AI匹配器")
+            else:
+                logger.debug("全自动导入 AI映射: AI匹配器未启用或初始化失败")
 
             # 创建并行任务
-            async def get_season_mapping():
+            async def get_ai_mapping():
                 try:
-                    return await metadata_manager.get_season_name(
-                        title=search_title,
-                        season_number=search_season,
-                        year=year,
-                        sources=sources,
-                        ai_matcher=ai_matcher,
-                        user=None,
-                        custom_prompt=custom_prompt if custom_prompt else None
-                    )
+                    # 先执行搜索获取结果，然后进行AI映射
+                    # 这里先返回None，实际映射在搜索后进行
+                    return None
                 except Exception as e:
-                    logger.warning(f"全自动导入 季度映射失败: {e}")
+                    logger.warning(f"全自动导入 AI映射失败: {e}")
                     return None
 
-            season_mapping_task = asyncio.create_task(get_season_mapping())
+            mapping_task = asyncio.create_task(get_ai_mapping())
         else:
             if auto_import_tmdb_enabled.lower() != "true":
-                logger.info("○ 全自动导入 季度映射: 功能未启用")
+                logger.info("○ 全自动导入 AI映射: 功能未启用")
             elif media_type == "movie":
-                logger.info("○ 全自动导入 季度映射: 电影类型,跳过")
-            elif not search_season or search_season <= 1:
-                logger.info(f"○ 全自动导入 季度映射: 季度号为{search_season},跳过(仅处理S02及以上)")
+                logger.info("○ 全自动导入 AI映射: 电影类型,跳过")
 
         logger.info(f"将使用标题 '{search_title}' 进行全网搜索...")
 
+        timer.step_start("弹幕源搜索")
         # 使用统一的搜索函数（与 WebUI 搜索保持一致）
         # 使用严格过滤模式和自定义别名
         # 外部控制API启用AI别名扩展（如果配置启用）
+        unified_search = _get_unified_search()
         all_results = await unified_search(
             search_term=search_title,
             session=session,
@@ -478,46 +533,68 @@ async def auto_search_and_import_task(
             episode_info=episode_info,  # 传递分集信息（与 WebUI 一致）
             alias_similarity_threshold=70,  # 使用 70% 别名相似度阈值（与 WebUI 一致）
         )
+        # 收集单源搜索耗时信息
+        source_timing_sub_steps = [
+            SubStepTiming(name=name, duration_ms=dur, result_count=cnt)
+            for name, dur, cnt in scraper_manager.last_search_timing
+        ]
+        _dur = timer.step_end(details=f"{len(all_results)}个结果", sub_steps=source_timing_sub_steps)
+        profiler.record_step("弹幕源搜索", _dur)
 
         logger.info(f"搜索完成，共 {len(all_results)} 个结果")
 
-        # 等待季度映射任务完成(如果有)
-        season_name_from_mapping = None
-        if season_mapping_task:
+        # 使用统一的AI类型和季度映射修正函数
+        if auto_import_tmdb_enabled.lower() == "true" and media_type != "movie":
             try:
-                season_name_from_mapping = await season_mapping_task
-                if season_name_from_mapping:
-                    logger.info(f"✓ 全自动导入 季度映射成功: '{search_title}' S{search_season:02d} → '{season_name_from_mapping}'")
+                timer.step_start("AI映射修正")
+                # 【性能优化】使用预热的AI匹配器
+                ai_matcher = None
+                if ai_matcher_warmup_task:
+                    ai_matcher = await ai_matcher_warmup_task
+                    ai_matcher_warmup_task = None  # 清空task，避免重复await
                 else:
-                    logger.info(f"○ 全自动导入 季度映射: 未找到季度名称")
+                    ai_matcher = await ai_matcher_manager.get_matcher()
+                if ai_matcher:
+                    logger.info(f"○ 全自动导入 开始统一AI映射修正: '{search_title}' ({len(all_results)} 个结果)")
+
+                    # 使用新的统一函数进行类型和季度修正
+                    mapping_result = await ai_type_and_season_mapping_and_correction(
+                        search_title=search_title,
+                        search_results=all_results,
+                        metadata_manager=metadata_manager,
+                        ai_matcher=ai_matcher,
+                        logger=logger,
+                        similarity_threshold=60.0
+                    )
+
+                    # 应用修正结果
+                    if mapping_result['total_corrections'] > 0:
+                        logger.info(f"✓ 全自动导入 统一AI映射成功: 总计修正了 {mapping_result['total_corrections']} 个结果")
+                        logger.info(f"  - 类型修正: {len(mapping_result['type_corrections'])} 个")
+                        logger.info(f"  - 季度修正: {len(mapping_result['season_corrections'])} 个")
+
+                        # 更新搜索结果（已经直接修改了all_results）
+                        all_results = mapping_result['corrected_results']
+                        _dur = timer.step_end(details=f"修正{mapping_result['total_corrections']}个")
+                    else:
+                        logger.info(f"○ 全自动导入 统一AI映射: 未找到需要修正的信息")
+                        _dur = timer.step_end(details="无修正")
+                else:
+                    logger.warning("○ 全自动导入 AI映射: AI匹配器未启用或初始化失败")
+                    _dur = timer.step_end(details="匹配器未启用")
+                profiler.record_step("AI映射修正", _dur)
+
             except Exception as e:
-                logger.warning(f"全自动导入 季度映射任务失败: {e}")
-
-        # 根据季度映射结果调整搜索结果的 season 字段
-        if season_name_from_mapping and search_season and search_season > 1:
-            from ..season_mapper import title_contains_season_name
-
-            adjusted_count = 0
-            for item in all_results:
-                # 只处理电视剧类型且 season 为 None 或 1 的结果
-                if item.type == "tv_series" and (item.season is None or item.season == 1):
-                    if title_contains_season_name(item.title, season_name_from_mapping, threshold=60.0):
-                        logger.info(f"  ✓ 季度调整: '{item.title}' (Provider: {item.provider}) season: {item.season} → {search_season}")
-                        item.season = search_season
-                        adjusted_count += 1
-
-            if adjusted_count > 0:
-                logger.info(f"✓ 根据季度映射调整了 {adjusted_count} 个结果的 season 字段")
+                logger.warning(f"全自动导入 统一AI映射任务执行失败: {e}")
+                _dur = timer.step_end(details=f"失败: {e}")
+                profiler.record_step("AI映射修正", _dur, success=False)
+        else:
+            if auto_import_tmdb_enabled.lower() != "true":
+                logger.info("○ 全自动导入 统一AI映射: 功能未启用")
+            elif media_type == "movie":
+                logger.info("○ 全自动导入 统一AI映射: 电影类型,跳过")
 
         # 根据标题关键词修正媒体类型（与 WebUI 一致）
-        def is_movie_by_title(title: str) -> bool:
-            if not title:
-                return False
-            # 关键词列表，不区分大小写
-            movie_keywords = ["剧场版", "劇場版", "movie", "映画"]
-            title_lower = title.lower()
-            return any(keyword in title_lower for keyword in movie_keywords)
-
         for item in all_results:
             if item.type == "tv_series" and is_movie_by_title(item.title):
                 logger.info(
@@ -628,7 +705,7 @@ async def auto_search_and_import_task(
                 # 获取精确标记信息
                 favorited_info = {}
                 async with scraper_manager._session_factory() as ai_session:
-                    from ..orm_models import AnimeSource
+                    from src.db.orm_models import AnimeSource
                     from sqlalchemy import select
 
                     for result in all_results:
@@ -647,9 +724,17 @@ async def auto_search_and_import_task(
                             key = f"{result.provider}:{result.mediaId}"
                             favorited_info[key] = True
 
+                # 识别词认知校正上下文（统一函数，命中标记+提示文案；不改排序）
+                recognition_info, recognition_hint = (
+                    await title_recognition_manager.build_recognition_context_for_results(all_results)
+                    if title_recognition_manager else ({}, None)
+                )
+                if recognition_hint:
+                    query_info["recognition_hint"] = recognition_hint
+
                 # 使用AIMatcherManager进行匹配
                 ai_selected_index = await ai_matcher_manager.select_best_match(
-                    query_info, all_results, favorited_info
+                    query_info, all_results, favorited_info, None, recognition_info
                 )
 
                 if ai_selected_index is not None:
@@ -683,15 +768,44 @@ async def auto_search_and_import_task(
         # 否则，如果启用了AI匹配，检查传统匹配兜底
         elif await ai_matcher_manager.is_enabled():
             ai_fallback_enabled = (await config_manager.get("aiFallbackEnabled", "true")).lower() == 'true'
-            if ai_fallback_enabled:
-                best_match = all_results[0]
-                logger.info(f"AI匹配未选择结果，使用传统匹配的最佳匹配: {best_match.title} (Provider: {best_match.provider})")
+            if ai_fallback_enabled and all_results:
+                # 传统匹配：验证第一个结果是否满足条件
+                first_result = all_results[0]
+                type_matched = first_result.type == media_type.value if hasattr(media_type, 'value') else first_result.type == str(media_type)
+                similarity = fuzz.token_set_ratio(main_title, first_result.title)
+
+                # 必须满足：类型匹配 AND 相似度 >= 70%
+                if type_matched and similarity >= 70:
+                    best_match = first_result
+                    logger.info(f"AI匹配未选择结果，使用传统匹配: {first_result.title} (Provider: {first_result.provider}, "
+                               f"类型匹配: ✓, 相似度: {similarity}%)")
+                else:
+                    best_match = None
+                    logger.warning(f"传统匹配失败: 第一个结果不满足条件 (类型匹配: {'✓' if type_matched else '✗'}, "
+                                 f"相似度: {similarity}%, 要求: ≥70%)")
             else:
                 logger.warning("AI匹配未选择结果，且传统匹配兜底已禁用，将不使用任何结果")
+                best_match = None
         # 如果未启用AI匹配，直接使用传统匹配
         else:
-            best_match = all_results[0]
-            logger.info(f"使用传统匹配的最佳匹配: {best_match.title} (Provider: {best_match.provider})")
+            if all_results:
+                # 传统匹配：验证第一个结果是否满足条件
+                first_result = all_results[0]
+                type_matched = first_result.type == media_type.value if hasattr(media_type, 'value') else first_result.type == str(media_type)
+                similarity = fuzz.token_set_ratio(main_title, first_result.title)
+
+                # 必须满足：类型匹配 AND 相似度 >= 70%
+                if type_matched and similarity >= 70:
+                    best_match = first_result
+                    logger.info(f"使用传统匹配: {first_result.title} (Provider: {first_result.provider}, "
+                               f"类型匹配: ✓, 相似度: {similarity}%)")
+                else:
+                    best_match = None
+                    logger.warning(f"传统匹配失败: 第一个结果不满足条件 (类型匹配: {'✓' if type_matched else '✗'}, "
+                                 f"相似度: {similarity}%, 要求: ≥70%)")
+            else:
+                best_match = None
+                logger.warning("传统匹配失败: 没有搜索结果")
 
         # 如果没有选择任何结果，抛出错误
         if not best_match:
@@ -715,7 +829,7 @@ async def auto_search_and_import_task(
                     raise ValueError(f"未找到 {best_match.provider} 的 scraper")
 
                 # 获取分集列表
-                episodes_list = await scraper.get_episodes(best_match.mediaId, db_media_type=media_type)
+                episodes_list = await scraper_manager.get_episodes_routed(best_match.provider, best_match.mediaId, db_media_type=media_type)
 
                 # 应用识别词转换
                 current_episode_index = 1
@@ -743,7 +857,7 @@ async def auto_search_and_import_task(
                                 logger.warning(f"未找到 {candidate.provider} 的 scraper，跳过")
                                 continue
 
-                            episodes_list = await scraper.get_episodes(candidate.mediaId, api_key=api_key)
+                            episodes_list = await scraper_manager.get_episodes_routed(candidate.provider, candidate.mediaId, db_media_type=candidate.type if hasattr(candidate, 'type') else None)
 
                             # 应用识别词转换
                             current_episode_index = 1
@@ -785,7 +899,7 @@ async def auto_search_and_import_task(
                                 logger.warning(f"未找到 {candidate.provider} 的 scraper，跳过")
                                 continue
 
-                            episodes_list = await scraper.get_episodes(candidate.mediaId, db_media_type=media_type)
+                            episodes_list = await scraper_manager.get_episodes_routed(candidate.provider, candidate.mediaId, db_media_type=media_type)
 
                             # 应用识别词转换
                             current_episode_index = 1
@@ -836,7 +950,7 @@ async def auto_search_and_import_task(
         # 应用存储后处理规则
         final_title = best_match.title
         if title_recognition_manager:
-            processed_title, _, _, postprocessing_applied = await title_recognition_manager.apply_storage_postprocessing(best_match.title, season)
+            processed_title, _, _, postprocessing_applied, _ = await title_recognition_manager.apply_storage_postprocessing(best_match.title, season)
             if postprocessing_applied:
                 final_title = processed_title
                 logger.info(f"✓ 应用存储后处理: '{best_match.title}' -> '{final_title}'")
@@ -854,7 +968,8 @@ async def auto_search_and_import_task(
             rate_limiter=rate_limiter,
             title_recognition_manager=title_recognition_manager,
             is_fallback=False,
-            selectedEpisodes=selected_episodes
+            selectedEpisodes=selected_episodes,
+            enable_incremental_refresh=bool(payload.enableIncrementalRefresh),
         )
 
         # 构建任务标题
@@ -888,7 +1003,8 @@ async def auto_search_and_import_task(
             "tmdbId": tmdb_id,
             "imdbId": imdb_id,
             "tvdbId": tvdb_id,
-            "bangumiId": bangumi_id
+            "bangumiId": bangumi_id,
+            "enableIncrementalRefresh": bool(payload.enableIncrementalRefresh),
         }
 
         execution_task_id, _ = await task_manager.submit_task(
@@ -898,8 +1014,18 @@ async def auto_search_and_import_task(
             task_type="generic_import",
             task_parameters=task_parameters
         )
+        timer.finish()  # 打印计时报告
+        # 写入性能统计（触发导入步骤）
+        profiler.record_step("触发导入任务", profiler.total_duration_ms)
+        await profiler.flush(session)
         final_message = f"已为最佳匹配源创建导入任务。执行任务ID: {execution_task_id}"
         raise TaskSuccess(final_message)
+    except TaskSuccess:
+        raise
+    except Exception as e:
+        # why：任何中途 raise ValueError/TaskFailed 也要确保 flush，避免数据丢失
+        await profiler.flush(session)
+        raise
     finally:
         if api_key:
             await scraper_manager.release_search_lock(api_key)

@@ -5,13 +5,10 @@ from typing import Callable, Optional, List
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from .. import crud
-from ..task_manager import TaskManager, TaskSuccess
-from ..config_manager import ConfigManager
-from ..scraper_manager import ScraperManager
-from ..metadata_manager import MetadataSourceManager
-from ..rate_limiter import RateLimiter
-from ..title_recognition import TitleRecognitionManager
+from src.db import crud, ConfigManager
+from src.db.orm_models import MediaItem, MediaServer
+from src.services import TaskManager, TaskSuccess, ScraperManager, MetadataSourceManager, TitleRecognitionManager, get_media_server_manager
+from src.rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +26,6 @@ async def scan_media_server_library(
     progress_callback: Callable
 ):
     """扫描媒体服务器的媒体库"""
-    from ..media_server_manager import get_media_server_manager
 
     await progress_callback(0, "开始扫描媒体库...")
 
@@ -89,6 +85,9 @@ async def scan_media_server_library(
                     server_id=server_id,
                     media_id=item.media_id,
                     library_id=library_id,
+                    series_id=getattr(item, 'series_id', None),
+                    season_id=getattr(item, 'season_id', None),
+                    episode_id=getattr(item, 'episode_id', None),
                     title=item.title,
                     media_type=item.media_type,
                     season=item.season,
@@ -113,6 +112,54 @@ async def scan_media_server_library(
     raise TaskSuccess(f"媒体库扫描完成,共扫描到 {total_items} 个媒体项")
 
 
+async def import_all_unimported_media_items(
+    server_id: int,
+    media_type: Optional[str],
+    session: AsyncSession,
+    task_manager: TaskManager,
+    progress_callback: Callable,
+    scraper_manager=None,
+    metadata_manager=None,
+    config_manager=None,
+    ai_matcher_manager=None,
+    rate_limiter=None,
+    title_recognition_manager=None
+):
+    """一键导入指定服务器下全部"未导入"媒体项。
+
+    why：未导入清单的计算依赖 crud.get_unimported_item_ids 中的关联子查询
+    （Anime×AnimeSource×Episode 三表 JOIN + func.replace 比对标题，索引失效），
+    媒体库较大时耗时可达数十秒。原实现放在 HTTP 接口内同步执行，用户点击按钮后
+    长时间无任何反馈，误以为功能失效（issue #441）。
+    改为在任务内部计算：接口立即返回 taskId，耗时过程有进度可见。
+    """
+    await progress_callback(0, "正在统计未导入的媒体项...")
+
+    item_ids = await crud.get_unimported_item_ids(session, server_id, media_type)
+    if not item_ids:
+        raise TaskSuccess("没有未导入的媒体项")
+
+    await progress_callback(5, f"共 {len(item_ids)} 个未导入媒体项，开始导入...")
+
+    # 复用既有导入逻辑；进度回调做区间压缩，把 5%~100% 留给实际导入过程
+    async def _scaled_callback(progress: int, description: str):
+        scaled = 5 + int(progress * 0.95)
+        await progress_callback(min(scaled, 100), description)
+
+    await import_media_items(
+        item_ids,
+        session,
+        task_manager,
+        _scaled_callback,
+        scraper_manager=scraper_manager,
+        metadata_manager=metadata_manager,
+        config_manager=config_manager,
+        ai_matcher_manager=ai_matcher_manager,
+        rate_limiter=rate_limiter,
+        title_recognition_manager=title_recognition_manager
+    )
+
+
 async def import_media_items(
     item_ids: List[int],
     session: AsyncSession,
@@ -126,16 +173,15 @@ async def import_media_items(
     title_recognition_manager=None
 ):
     """导入媒体项(按季度导入电视剧,电影直接导入)"""
-    from ..orm_models import MediaItem
 
     webhook_search_and_dispatch_task = _get_webhook_search_and_dispatch_task()
 
     # 如果没有传入manager,从全局获取
     if scraper_manager is None:
-        from ..main import scraper_manager as global_scraper_manager
+        from src.main import scraper_manager as global_scraper_manager
         scraper_manager = global_scraper_manager
     if metadata_manager is None:
-        from ..main import metadata_manager as global_metadata_manager
+        from src.main import metadata_manager as global_metadata_manager
         metadata_manager = global_metadata_manager
     if config_manager is None:
         raise ValueError("config_manager is required")
@@ -148,13 +194,24 @@ async def import_media_items(
 
     await progress_callback(0, "开始导入媒体项...")
 
-    # 获取所有媒体项
-    items_stmt = select(MediaItem).where(MediaItem.id.in_(item_ids))
-    result = await session.execute(items_stmt)
-    items = result.scalars().all()
+    # 获取所有媒体项（分批查询，避免 asyncpg 的 32767 参数限制）
+    BATCH_SIZE = 30000
+    items = []
+    for i in range(0, len(item_ids), BATCH_SIZE):
+        batch_ids = item_ids[i:i + BATCH_SIZE]
+        items_stmt = select(MediaItem).where(MediaItem.id.in_(batch_ids))
+        result = await session.execute(items_stmt)
+        items.extend(result.scalars().all())
 
     if not items:
         raise ValueError("未找到要导入的媒体项")
+
+    # 获取媒体服务器类型（用于写入 mediaServerType，支持删除联动）
+    media_server_type = None
+    if items:
+        server_stmt = select(MediaServer.providerName).where(MediaServer.id == items[0].serverId).limit(1)
+        server_result = await session.execute(server_stmt)
+        media_server_type = server_result.scalar_one_or_none()
 
     # 按类型分组
     movies = []
@@ -186,17 +243,19 @@ async def import_media_items(
 
         try:
             # 触发webhook式搜索
+            # 注意: lambda 使用默认参数 m=movie 来捕获当前循环变量的值,
+            # 避免闭包捕获引用导致所有任务都使用最后一个 movie 的数据
             task_id, _ = await task_manager.submit_task(
-                lambda session, progress_callback: webhook_search_and_dispatch_task(
-                    animeTitle=movie.title,
+                lambda session, progress_callback, m=movie, mst=media_server_type: webhook_search_and_dispatch_task(
+                    animeTitle=m.title,
                     mediaType="movie",
                     season=1,
                     currentEpisodeIndex=1,
-                    searchKeyword=movie.title,
-                    year=movie.year,
-                    tmdbId=movie.tmdbId,
-                    tvdbId=movie.tvdbId,
-                    imdbId=movie.imdbId,
+                    searchKeyword=m.title,
+                    year=m.year,
+                    tmdbId=m.tmdbId,
+                    tvdbId=m.tvdbId,
+                    imdbId=m.imdbId,
                     doubanId=None,
                     bangumiId=None,
                     webhookSource="media_server",
@@ -208,10 +267,35 @@ async def import_media_items(
                     config_manager=config_manager,
                     ai_matcher_manager=ai_matcher_manager,
                     rate_limiter=rate_limiter,
-                    title_recognition_manager=title_recognition_manager
+                    title_recognition_manager=title_recognition_manager,
+                    # 媒体服务三级 ID（删除联动用）
+                    mediaServerType=mst,
+                    mediaServerSeriesId=str(m.seriesId or m.mediaId) if (m.seriesId or m.mediaId) is not None else None,
+                    mediaServerSeasonId=str(m.seasonId) if m.seasonId is not None else None,
+                    mediaServerEpisodeId=str(m.episodeId or m.mediaId) if (m.episodeId or m.mediaId) is not None else None,
                 ),
                 title=f"自动导入 (库内): {movie.title}",
-                queue_type="download"
+                queue_type="download",
+                # 关键修复(任务重启恢复)：补 task_type + task_parameters。
+                # 原先未传 task_type → _run_task_wrapper 不写 TaskStateCache → 程序重启后
+                # 无法恢复，只能被标"因程序重启而中断"。task_type=webhook_search 对应
+                # _rebuild_coro_factory 的 webhook_search 分支（重建 webhook_search_and_dispatch_task）。
+                task_type="webhook_search",
+                task_parameters={
+                    "animeTitle": movie.title,
+                    "mediaType": "movie",
+                    "season": 1,
+                    "currentEpisodeIndex": 1,
+                    "searchKeyword": movie.title,
+                    "year": movie.year,
+                    "tmdbId": movie.tmdbId,
+                    "tvdbId": movie.tvdbId,
+                    "imdbId": movie.imdbId,
+                    "doubanId": None,
+                    "bangumiId": None,
+                    "webhookSource": "media_server",
+                    "imageUrl": movie.posterUrl,
+                },
             )
             logger.info(f"电影 {movie.title} 导入任务已提交: {task_id}")
 
@@ -230,9 +314,10 @@ async def import_media_items(
 
     # 导入电视节目(按季度合并为单个任务)
     for (title, season), season_items in tv_shows.items():
+        season_str = f"S{season:02d}" if season is not None else "S??"
         await progress_callback(
             int((completed / total_tasks) * 100),
-            f"导入电视节目: {title} S{season:02d} (共 {len(season_items)} 集)..."
+            f"导入电视节目: {title} {season_str} (共 {len(season_items)} 集)..."
         )
 
         try:
@@ -243,15 +328,15 @@ async def import_media_items(
             )
 
             selected_episodes = sorted([item.episode for item in season_items if item.episode is not None])
-            logger.info(f"电视节目 {title} S{season:02d} 选中的分集: {selected_episodes}")
+            logger.info(f"电视节目 {title} {season_str} 选中的分集: {selected_episodes}")
 
             task_id, _ = await task_manager.submit_task(
-                lambda session, progress_callback, item=representative_item, selected_eps=selected_episodes: webhook_search_and_dispatch_task(
+                lambda session, progress_callback, item=representative_item, selected_eps=selected_episodes, mst=media_server_type: webhook_search_and_dispatch_task(
                     animeTitle=item.title,
                     mediaType="tv_series",
                     season=item.season,
                     currentEpisodeIndex=item.episode,  # 使用代表集数进行匹配
-                    searchKeyword=f"{item.title} S{item.season:02d}E{item.episode:02d}",
+                    searchKeyword=f"{item.title} S{item.season or 1:02d}E{item.episode or 1:02d}",
                     year=item.year,
                     tmdbId=item.tmdbId,
                     tvdbId=item.tvdbId,
@@ -269,9 +354,32 @@ async def import_media_items(
                     rate_limiter=rate_limiter,
                     title_recognition_manager=title_recognition_manager,
                     selectedEpisodes=selected_eps,
+                    mediaServerType=mst,
+                    mediaServerSeriesId=str(item.seriesId or item.mediaId) if (item.seriesId or item.mediaId) is not None else None,
+                    mediaServerSeasonId=str(item.seasonId) if item.seasonId is not None else None,
+                    mediaServerEpisodeId=str(item.episodeId or item.mediaId) if (item.episodeId or item.mediaId) is not None else None,
                 ),
                 title=f"自动导入 (库内): {title} S{season:02d} (共 {len(season_items)} 集)",
-                queue_type="download"
+                queue_type="download",
+                # 关键修复(任务重启恢复)：补 task_type=webhook_search + task_parameters，
+                # 使 _run_task_wrapper 能写 TaskStateCache，程序重启后可经 _rebuild_coro_factory 恢复。
+                task_type="webhook_search",
+                task_parameters={
+                    "animeTitle": representative_item.title,
+                    "mediaType": "tv_series",
+                    "season": representative_item.season,
+                    "currentEpisodeIndex": representative_item.episode,
+                    "searchKeyword": f"{representative_item.title} S{representative_item.season or 1:02d}E{representative_item.episode or 1:02d}",
+                    "year": representative_item.year,
+                    "tmdbId": representative_item.tmdbId,
+                    "tvdbId": representative_item.tvdbId,
+                    "imdbId": representative_item.imdbId,
+                    "doubanId": None,
+                    "bangumiId": None,
+                    "webhookSource": "media_server",
+                    "selectedEpisodes": selected_episodes,
+                    "imageUrl": representative_item.posterUrl,
+                },
             )
             logger.info(f"电视节目 {title} S{season:02d} (共 {len(season_items)} 集) 导入任务已提交: {task_id}")
 

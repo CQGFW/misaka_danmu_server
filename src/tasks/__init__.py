@@ -45,6 +45,7 @@ from .refresh import (
     refresh_episode_task,
     refresh_bulk_episodes_task,
     incremental_refresh_task,
+    fill_missing_task,
 )
 
 # 分集管理任务
@@ -80,6 +81,7 @@ from .webhook import (
 from .media_server import (
     scan_media_server_library,
     import_media_items,
+    import_all_unimported_media_items,
 )
 
 __all__ = [
@@ -112,6 +114,7 @@ __all__ = [
     'refresh_episode_task',
     'refresh_bulk_episodes_task',
     'incremental_refresh_task',
+    'fill_missing_task',
     # 分集管理任务
     'reorder_episodes_task',
     'offset_episodes_task',
@@ -129,5 +132,6 @@ __all__ = [
     # 媒体服务器任务
     'scan_media_server_library',
     'import_media_items',
+    'import_all_unimported_media_items',
 ]
 

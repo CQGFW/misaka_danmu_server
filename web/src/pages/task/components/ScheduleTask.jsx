@@ -1,13 +1,16 @@
 import {
   Button,
   Card,
+  Empty,
   Form,
   Input,
+  InputNumber,
   Modal,
   Select,
   Space,
   Switch,
   Table,
+  Tabs,
   Tag,
   Tooltip,
   Typography,
@@ -26,6 +29,8 @@ import { MyIcon } from '@/components/MyIcon.jsx'
 import dayjs from 'dayjs'
 import { useModal } from '../../../ModalContext'
 import { useMessage } from '../../../MessageContext'
+import { useTranslation } from 'react-i18next'
+import { getLocalizedField, localizeItems } from '../../../utils/i18nDynamic'
 import { Cron } from 'react-js-cron'
 import 'react-js-cron/dist/styles.css'
 import cronstrue from 'cronstrue/i18n'
@@ -33,12 +38,19 @@ import { useAtomValue } from 'jotai'
 import { isMobileAtom } from '../../../../store'
 
 export const ScheduleTask = () => {
+  const { t, i18n } = useTranslation()
   const [loading, setLoading] = useState(true)
   const [addOpen, setAddOpen] = useState(false)
   const [confirmLoading, setConfirmLoading] = useState(false)
   const [tasks, setTasks] = useState([])
   const [availableJobTypes, setAvailableJobTypes] = useState([])
   const [advancedMode, setAdvancedMode] = useState(false)
+
+  // Cron 组件本地化配置（随语言切换）
+  const cronLocale = t('cronLocale', { returnObjects: true })
+
+  // cronstrue 语言映射
+  const cronstrueLocale = i18n.language === 'en' ? 'en' : i18n.language === 'zh-TW' ? 'zh_TW' : 'zh_CN'
 
   const [form] = Form.useForm()
   const editid = Form.useWatch('taskId', form)
@@ -49,9 +61,9 @@ export const ScheduleTask = () => {
   // 获取Cron表达式的人类可读描述
   const getCronDescription = (cronExpression) => {
     try {
-      return cronstrue.toString(cronExpression, { locale: 'zh_CN' })
+      return cronstrue.toString(cronExpression, { locale: cronstrueLocale })
     } catch (error) {
-      return '无效的Cron表达式'
+      return t('scheduleTask.invalidCron')
     }
   }
 
@@ -59,10 +71,115 @@ export const ScheduleTask = () => {
   const validateCron = (cronExpression) => {
     if (!cronExpression) return false
     try {
-      cronstrue.toString(cronExpression, { locale: 'zh_CN' })
+      cronstrue.toString(cronExpression, { locale: cronstrueLocale })
       return true
     } catch (error) {
       return false
+    }
+  }
+
+  // 根据 configSchema 中的配置项定义，渲染对应的表单控件
+  // why：显式传入 i18n.language 确保语言切换时 React 能感知到变化并重渲染
+  const renderConfigFormItem = (item) => {
+    const { key, type, min, max, rows, options } = item
+    const label = getLocalizedField(item, 'label', i18n.language)
+    const description = getLocalizedField(item, 'description', i18n.language)
+    const placeholder = getLocalizedField(item, 'placeholder', i18n.language)
+    const suffix = getLocalizedField(item, 'suffix', i18n.language)
+
+    switch (type) {
+      case 'boolean':
+        return (
+          <Form.Item
+            key={key}
+            name={['taskConfig', key]}
+            label={label}
+            valuePropName="checked"
+            className="mb-4"
+            tooltip={description}
+          >
+            <Switch checkedChildren={t('common.enable')} unCheckedChildren={t('common.disable')} />
+          </Form.Item>
+        )
+
+      case 'password':
+        return (
+          <Form.Item
+            key={key}
+            name={['taskConfig', key]}
+            label={label}
+            className="mb-4"
+            tooltip={description}
+          >
+            <Input.Password placeholder={placeholder} />
+          </Form.Item>
+        )
+
+      case 'number':
+        return (
+          <Form.Item
+            key={key}
+            name={['taskConfig', key]}
+            label={label}
+            className="mb-4"
+            tooltip={description}
+          >
+            <InputNumber
+              min={min}
+              max={max}
+              addonAfter={suffix}
+              placeholder={placeholder}
+              style={{ width: '100%' }}
+            />
+          </Form.Item>
+        )
+
+      case 'textarea':
+        return (
+          <Form.Item
+            key={key}
+            name={['taskConfig', key]}
+            label={label}
+            className="mb-4"
+            tooltip={description}
+          >
+            <Input.TextArea rows={rows || 3} placeholder={placeholder} />
+          </Form.Item>
+        )
+
+      case 'select':
+        return (
+          <Form.Item
+            key={key}
+            name={['taskConfig', key]}
+            label={label}
+            className="mb-4"
+            tooltip={description}
+          >
+            <Select
+              placeholder={placeholder}
+              options={localizeItems(
+                options?.map(opt =>
+                  typeof opt === 'string' ? { value: opt, label: opt } : opt
+                ),
+                ['label']
+              )}
+            />
+          </Form.Item>
+        )
+
+      default: // string
+        return (
+          <Form.Item
+            key={key}
+            name={['taskConfig', key]}
+            label={label}
+            className="mb-4"
+            tooltip={description}
+          >
+            <Input placeholder={placeholder} />
+          </Form.Item>
+        )
     }
   }
 
@@ -76,7 +193,7 @@ export const ScheduleTask = () => {
       setTasks(tasksRes.data || [])
       setAvailableJobTypes(jobsRes.data || [])
     } catch (error) {
-      messageApi.error('获取定时任务信息失败')
+      messageApi.error(t('scheduleTask.fetchFailed'))
     } finally {
       setLoading(false)
     }
@@ -88,13 +205,21 @@ export const ScheduleTask = () => {
 
   const columns = [
     {
-      title: '名称',
+      title: t('scheduleTask.colName'),
       dataIndex: 'name',
       key: 'name',
       width: 150,
+      render: (name, record) => {
+        // 如果任务名称等于对应 jobType 的默认中文名，则显示本地化名称
+        const jobType = availableJobTypes.find(j => j.jobType === record.jobType)
+        if (jobType && name === jobType.name) {
+          return getLocalizedField(jobType, 'name')
+        }
+        return name
+      },
     },
     {
-      title: '类型',
+      title: t('scheduleTask.colType'),
       dataIndex: 'jobType',
       key: 'jobType',
       width: 200,
@@ -104,22 +229,22 @@ export const ScheduleTask = () => {
         )
         return (
           <div className="flex items-center gap-2">
-            <span>{jobType?.name || record.jobType}</span>
+            <span>{getLocalizedField(jobType, 'name') || record.jobType}</span>
             {record.isSystemTask && (
-              <Tag color="blue" size="small">系统任务</Tag>
+              <Tag color="blue" size="small">{t('scheduleTask.systemTask')}</Tag>
             )}
           </div>
         )
       },
     },
     {
-      title: 'Cron表达式',
+      title: t('scheduleTask.colCron'),
       width: 150,
       dataIndex: 'cronExpression',
       key: 'cronExpression',
     },
     {
-      title: '状态',
+      title: t('scheduleTask.colStatus'),
       dataIndex: 'isEnabled',
       key: 'isEnabled',
       width: 100,
@@ -127,16 +252,16 @@ export const ScheduleTask = () => {
         return (
           <div>
             {record.isEnabled ? (
-              <Tag color="green">启用</Tag>
+              <Tag color="green">{t('scheduleTask.enabled')}</Tag>
             ) : (
-              <Tag color="red">禁用</Tag>
+              <Tag color="red">{t('scheduleTask.disabled')}</Tag>
             )}
           </div>
         )
       },
     },
     {
-      title: '上次运行时间',
+      title: t('scheduleTask.colLastRun'),
       dataIndex: 'lastRunAt',
       key: 'lastRunAt',
       width: 200,
@@ -147,7 +272,7 @@ export const ScheduleTask = () => {
       },
     },
     {
-      title: '下次运行时间',
+      title: t('scheduleTask.colNextRun'),
       dataIndex: 'nextRunAt',
       key: 'nextRunAt',
       width: 200,
@@ -158,7 +283,7 @@ export const ScheduleTask = () => {
       },
     },
     {
-      title: '操作',
+      title: t('scheduleTask.colAction'),
       width: 100,
       fixed: 'right',
       render: (_, record) => {
@@ -174,7 +299,7 @@ export const ScheduleTask = () => {
             <span
               className="cursor-pointer hover:text-primary"
               onClick={() => handleRun(record)}
-              title="立即运行"
+              title={t('scheduleTask.runNow')}
             >
               <MyIcon icon="canshuzhihang" size={20}></MyIcon>
             </span>
@@ -183,17 +308,18 @@ export const ScheduleTask = () => {
               onClick={() => {
                 form.setFieldsValue({
                   ...record,
+                  taskConfig: record.taskConfig || {},
                 })
                 setAddOpen(true)
               }}
-              title="编辑任务"
+              title={t('scheduleTask.editTask')}
             >
               <MyIcon icon="edit" size={20}></MyIcon>
             </span>
             <span
               className="cursor-pointer hover:text-primary"
               onClick={() => handleDelete(record)}
-              title="删除任务"
+              title={t('scheduleTask.deleteTask')}
             >
               <MyIcon icon="delete" size={20}></MyIcon>
             </span>
@@ -206,9 +332,9 @@ export const ScheduleTask = () => {
   const handleRun = async record => {
     try {
       await runTask({ id: record.taskId })
-      messageApi.success('任务已触发运行，请稍后刷新查看运行时间。')
+      messageApi.success(t('scheduleTask.runTriggered'))
     } catch (error) {
-      messageApi.error('任务触发失败，请稍后重试。')
+      messageApi.error(t('scheduleTask.runFailed'))
     }
   }
 
@@ -218,26 +344,26 @@ export const ScheduleTask = () => {
       try {
         setConfirmLoading(true)
         await editScheduledTask({ ...values, id: values.taskId })
-        messageApi.success('任务编辑成功。')
+        messageApi.success(t('scheduleTask.editSuccess'))
         form.resetFields()
         fetchData()
         setAddOpen(false)
         setAdvancedMode(false)
       } catch (error) {
-        messageApi.error(error?.detail ?? '任务编辑失败，请稍后重试。')
+        messageApi.error(error?.detail ?? t('scheduleTask.editFailed'))
       } finally {
         setConfirmLoading(false)
       }
     } else {
       try {
         await addScheduledTask(values)
-        messageApi.success('任务添加成功。')
+        messageApi.success(t('scheduleTask.addSuccess'))
         form.resetFields()
         fetchData()
         setAddOpen(false)
         setAdvancedMode(false)
       } catch (error) {
-        messageApi.error(error?.detail ?? '任务添加失败，请稍后重试。')
+        messageApi.error(error?.detail ?? t('scheduleTask.addFailed'))
       } finally {
         setConfirmLoading(false)
       }
@@ -246,18 +372,18 @@ export const ScheduleTask = () => {
 
   const handleDelete = async record => {
     modalApi.confirm({
-      title: '删除任务',
+      title: t('scheduleTask.deleteTitle'),
       zIndex: 1002,
-      content: <div>确定要删除这个定时任务吗？</div>,
-      okText: '确认',
-      cancelText: '取消',
+      content: <div>{t('scheduleTask.deleteConfirm')}</div>,
+      okText: t('scheduleTask.confirm'),
+      cancelText: t('scheduleTask.cancel'),
       onOk: async () => {
         try {
           await deleteScheduledTask({ id: record.taskId })
-          messageApi.success('任务删除成功。')
+          messageApi.success(t('scheduleTask.deleteSuccess'))
           fetchData()
         } catch (error) {
-          messageApi.error(error?.detail ?? '任务删除失败，请稍后重试。')
+          messageApi.error(error?.detail ?? t('scheduleTask.deleteFailed'))
         }
       },
     })
@@ -265,9 +391,11 @@ export const ScheduleTask = () => {
 
   return (
     <div className="my-6">
+      {/* why：加 schedule-task-card 类名，让 CSS 能单独针对这张卡片做差异化视觉 */}
       <Card
+        className="schedule-task-card"
         loading={loading}
-        title="定时任务"
+        title={t('scheduleTask.title')}
         extra={
           <Button
             type="primary"
@@ -275,12 +403,12 @@ export const ScheduleTask = () => {
               setAddOpen(true)
             }}
           >
-            添加定时任务
+            {t('scheduleTask.addTask')}
           </Button>
         }
       >
         <div className="mb-4">
-          定时任务用于自动执行维护操作，例如自动更新和映射TMDB数据。使用标准的Cron表达式格式。
+          {t('scheduleTask.intro')}
         </div>
         {isMobile ? (
           <div className="grid grid-cols-1 gap-4">
@@ -296,16 +424,16 @@ export const ScheduleTask = () => {
                   className="shadow-sm hover:shadow-md transition-shadow"
                   title={
                     <div className="flex items-center justify-between">
-                      <span className="font-medium text-lg">{task.name}</span>
+                      <span className="font-medium text-lg">{(jobType && task.name === jobType.name) ? getLocalizedField(jobType, 'name') : task.name}</span>
                       {isSystemTask && (
-                        <Tag color="blue" size="small">系统任务</Tag>
+                        <Tag color="blue" size="small">{t('scheduleTask.systemTask')}</Tag>
                       )}
                     </div>
                   }
                   extra={
                     !isSystemTask && (
                       <Space size="small">
-                        <Tooltip title="立即运行">
+                        <Tooltip title={t('scheduleTask.runNow')}>
                           <Button
                             type="text"
                             icon={<MyIcon icon="canshuzhihang" size={16} />}
@@ -313,20 +441,21 @@ export const ScheduleTask = () => {
                             size="small"
                           />
                         </Tooltip>
-                        <Tooltip title="编辑任务">
+                        <Tooltip title={t('scheduleTask.editTask')}>
                           <Button
                             type="text"
                             icon={<MyIcon icon="edit" size={16} />}
                             onClick={() => {
                               form.setFieldsValue({
                                 ...task,
+                                taskConfig: task.taskConfig || {},
                               })
                               setAddOpen(true)
                             }}
                             size="small"
                           />
                         </Tooltip>
-                        <Tooltip title="删除任务">
+                        <Tooltip title={t('scheduleTask.deleteTask')}>
                           <Button
                             type="text"
                             icon={<MyIcon icon="delete" size={16} />}
@@ -341,31 +470,42 @@ export const ScheduleTask = () => {
                 >
                   <div className="space-y-3">
                     <div className="flex items-center gap-2">
-                      <span className="text-gray-600">类型：</span>
-                      <span>{jobType?.name || task.jobType}</span>
+                      <span className="text-gray-600">{t('scheduleTask.typeLabel')}</span>
+                      <span>{getLocalizedField(jobType, 'name') || task.jobType}</span>
                     </div>
 
                     <div className="flex items-center gap-2">
-                      <span className="text-gray-600">Cron表达式：</span>
+                      <span className="text-gray-600">{t('scheduleTask.cronLabel')}</span>
                       <Typography.Text code>{task.cronExpression}</Typography.Text>
                     </div>
 
                     <div className="flex items-center gap-2">
-                      <span className="text-gray-600">状态：</span>
+                      <span className="text-gray-600">{t('scheduleTask.statusLabel')}</span>
                       {task.isEnabled ? (
-                        <Tag color="green">启用</Tag>
+                        <Tag color="green">{t('scheduleTask.enabled')}</Tag>
                       ) : (
-                        <Tag color="red">禁用</Tag>
+                        <Tag color="red">{t('scheduleTask.disabled')}</Tag>
                       )}
                     </div>
 
+                    {task.jobType === 'tmdbAutoScrape' && (
+                      <div className="flex items-center gap-2">
+                        <span className="text-gray-600">{t('scheduleTask.forceScrape')}</span>
+                        {task.taskConfig?.forceScrape ? (
+                          <Tag color="orange">{t('scheduleTask.on')}</Tag>
+                        ) : (
+                          <Tag>{t('scheduleTask.off')}</Tag>
+                        )}
+                      </div>
+                    )}
+
                     <div className="grid grid-cols-1 gap-2 text-sm">
                       <div className="flex justify-between">
-                        <span className="text-gray-600">上次运行：</span>
+                        <span className="text-gray-600">{t('scheduleTask.lastRun')}</span>
                         <span>{dayjs(task.lastRunAt).format('YYYY-MM-DD HH:mm:ss')}</span>
                       </div>
                       <div className="flex justify-between">
-                        <span className="text-gray-600">下次运行：</span>
+                        <span className="text-gray-600">{t('scheduleTask.nextRun')}</span>
                         <span>{dayjs(task.nextRunAt).format('YYYY-MM-DD HH:mm:ss')}</span>
                       </div>
                     </div>
@@ -386,12 +526,12 @@ export const ScheduleTask = () => {
         )}
       </Card>
       <Modal
-        title={!!editid ? '编辑定时任务' : '添加定时任务'}
+        title={!!editid ? t('scheduleTask.editModalTitle') : t('scheduleTask.addModalTitle')}
         open={addOpen}
         onOk={handleAdd}
         confirmLoading={confirmLoading}
-        cancelText="取消"
-        okText="确认"
+        cancelText={t('scheduleTask.cancel')}
+        okText={t('scheduleTask.confirm')}
         onCancel={() => {
           setAddOpen(false)
           setAdvancedMode(false)
@@ -407,181 +547,148 @@ export const ScheduleTask = () => {
           initialValues={{
             jobType: availableJobTypes.filter(job => !job.isSystemTask)[0]?.jobType || '',
             isEnabled: true,
+            taskConfig: {},
             cronExpression: '0 2 * * *',
           }}
         >
-          <Form.Item
-            name="name"
-            label="任务名称"
-            rules={[{ required: true, message: '请输入任务名称' }]}
-            className="mb-4"
-          >
-            <Input placeholder="例如：我的每日TMDB更新" />
-          </Form.Item>
-          <Form.Item
-            name="jobType"
-            label="任务类型"
-            rules={[{ required: true, message: '请选择任务类型' }]}
-            className="mb-4"
-          >
-            <Select>
-              {availableJobTypes
-                .filter(job => !job.isSystemTask) // 过滤掉系统任务
-                .map(job => (
-                  <Select.Option key={job.jobType} value={job.jobType}>
-                    <Tooltip title={job.description} placement="right">
-                      <span>{job.name}</span>
-                    </Tooltip>
-                  </Select.Option>
-                ))}
-            </Select>
-          </Form.Item>
-          <Form.Item
-            name="cronExpression"
-            label={
-              <div className="flex items-center justify-between w-full">
-                <span>Cron表达式</span>
-                <Button
-                  type="link"
-                  size="small"
-                  onClick={() => setAdvancedMode(!advancedMode)}
-                  className="p-0"
-                >
-                  {advancedMode ? '可视化模式' : '高级模式'}
-                </Button>
-              </div>
-            }
-            rules={[{ required: true, message: '请输入Cron表达式' }]}
-            className="mb-4"
-          >
-            {advancedMode ? (
-              <Input
-                placeholder="例如：0 2 * * *（每天凌晨2点）"
-                suffix={
-                  form.getFieldValue('cronExpression') ? (
-                    validateCron(form.getFieldValue('cronExpression')) ? (
-                      <CheckCircleOutlined
-                        style={{ color: '#52c41a', fontSize: 16 }}
-                      />
-                    ) : (
-                      <CloseCircleOutlined
-                        style={{ color: '#ff4d4f', fontSize: 16 }}
-                      />
-                    )
-                  ) : null
-                }
-              />
-            ) : (
-              <Cron
-                value={form.getFieldValue('cronExpression') || '0 2 * * *'}
-                setValue={(newValue) => {
-                  form.setFieldsValue({ cronExpression: newValue })
-                }}
-                clearButton={false}
-                locale={{
-                  everyText: '每',
-                  emptyMonths: '每月',
-                  emptyMonthDays: '每天',
-                  emptyMonthDaysShort: '天',
-                  emptyWeekDays: '每周',
-                  emptyWeekDaysShort: '周',
-                  emptyHours: '每小时',
-                  emptyMinutes: '每分钟',
-                  emptyMinutesForHourPeriod: '每分钟',
-                  yearOption: '年',
-                  monthOption: '月',
-                  weekOption: '周',
-                  dayOption: '天',
-                  hourOption: '小时',
-                  minuteOption: '分钟',
-                  rebootOption: '重启时',
-                  prefixPeriod: '每',
-                  prefixMonths: '在',
-                  prefixMonthDays: '在',
-                  prefixWeekDays: '在',
-                  prefixWeekDaysForMonthAndYearPeriod: '和',
-                  prefixHours: '在',
-                  prefixMinutes: '在',
-                  prefixMinutesForHourPeriod: '在',
-                  suffixMinutesForHourPeriod: '分',
-                  errorInvalidCron: '无效的Cron表达式',
-                  weekDays: [
-                    '星期日',
-                    '星期一',
-                    '星期二',
-                    '星期三',
-                    '星期四',
-                    '星期五',
-                    '星期六',
-                  ],
-                  months: [
-                    '一月',
-                    '二月',
-                    '三月',
-                    '四月',
-                    '五月',
-                    '六月',
-                    '七月',
-                    '八月',
-                    '九月',
-                    '十月',
-                    '十一月',
-                    '十二月',
-                  ],
-                  altWeekDays: [
-                    '周日',
-                    '周一',
-                    '周二',
-                    '周三',
-                    '周四',
-                    '周五',
-                    '周六',
-                  ],
-                  altMonths: [
-                    '1月',
-                    '2月',
-                    '3月',
-                    '4月',
-                    '5月',
-                    '6月',
-                    '7月',
-                    '8月',
-                    '9月',
-                    '10月',
-                    '11月',
-                    '12月',
-                  ],
-                }}
-              />
-            )}
-          </Form.Item>
-          <Form.Item noStyle shouldUpdate>
-            {() => {
-              const currentCron = form.getFieldValue('cronExpression')
-              if (currentCron && !advancedMode) {
-                return (
-                  <div className="mb-4 p-3 bg-blue-50 rounded border border-blue-200">
-                    <div className="text-sm text-gray-600">
-                      <span className="font-medium">执行时间：</span>
-                      {getCronDescription(currentCron)}
-                    </div>
-                  </div>
-                )
-              }
-              return null
-            }}
-          </Form.Item>
-          <Form.Item
-            name="isEnabled"
-            label="是否启用"
-            valuePropName="checked"
-            className="mb-4"
-          >
-            <Switch checkedChildren="启用" unCheckedChildren="禁用" />
-          </Form.Item>
           <Form.Item name="taskId" label="taskId" hidden>
             <Input disabled />
           </Form.Item>
+          <Tabs
+            defaultActiveKey="general"
+            items={[
+              {
+                key: 'general',
+                label: t('scheduleTask.tabGeneral'),
+                forceRender: true,
+                children: (
+                  <>
+                    <Form.Item
+                      name="name"
+                      label={t('scheduleTask.taskName')}
+                      rules={[{ required: true, message: t('scheduleTask.taskNameRequired') }]}
+                      className="mb-4"
+                    >
+                      <Input placeholder={t('scheduleTask.taskNamePlaceholder')} />
+                    </Form.Item>
+                    <Form.Item
+                      name="jobType"
+                      label={t('scheduleTask.taskType')}
+                      rules={[{ required: true, message: t('scheduleTask.taskTypeRequired') }]}
+                      className="mb-4"
+                    >
+                      <Select disabled={!!editid}>
+                        {availableJobTypes
+                          .filter(job => !job.isSystemTask)
+                          .map(job => (
+                            <Select.Option key={job.jobType} value={job.jobType}>
+                              <Tooltip title={getLocalizedField(job, 'description')} placement="right">
+                                <span>{getLocalizedField(job, 'name')}</span>
+                              </Tooltip>
+                            </Select.Option>
+                          ))}
+                      </Select>
+                    </Form.Item>
+                    <Form.Item
+                      name="cronExpression"
+                      label={
+                        <div className="flex items-center justify-between w-full">
+                          <span>{t('scheduleTask.colCron')}</span>
+                          <Button
+                            type="link"
+                            size="small"
+                            onClick={() => setAdvancedMode(!advancedMode)}
+                            className="p-0"
+                          >
+                            {advancedMode ? t('scheduleTask.visualMode') : t('scheduleTask.advancedMode')}
+                          </Button>
+                        </div>
+                      }
+                      rules={[{ required: true, message: t('scheduleTask.cronRequired') }]}
+                      className="mb-4"
+                    >
+                      {advancedMode ? (
+                        <Input
+                          placeholder={t('scheduleTask.cronPlaceholder')}
+                          suffix={
+                            form.getFieldValue('cronExpression') ? (
+                              validateCron(form.getFieldValue('cronExpression')) ? (
+                                <CheckCircleOutlined
+                                  style={{ color: '#52c41a', fontSize: 16 }}
+                                />
+                              ) : (
+                                <CloseCircleOutlined
+                                  style={{ color: '#ff4d4f', fontSize: 16 }}
+                                />
+                              )
+                            ) : null
+                          }
+                        />
+                      ) : (
+                        <Cron
+                          value={form.getFieldValue('cronExpression') || '0 2 * * *'}
+                          setValue={(newValue) => {
+                            form.setFieldsValue({ cronExpression: newValue })
+                          }}
+                          clearButton={false}
+                          locale={cronLocale}
+                        />
+                      )}
+                    </Form.Item>
+                    <Form.Item noStyle shouldUpdate>
+                      {() => {
+                        const currentCron = form.getFieldValue('cronExpression')
+                        if (currentCron && !advancedMode) {
+                          return (
+                            <div className="mb-4 p-3 bg-blue-50 dark:bg-blue-900/20 rounded border border-blue-200 dark:border-blue-800">
+                              <div className="text-sm text-gray-600 dark:text-gray-300">
+                                <span className="font-medium">{t('scheduleTask.executeTime')}</span>
+                                {getCronDescription(currentCron)}
+                              </div>
+                            </div>
+                          )
+                        }
+                        return null
+                      }}
+                    </Form.Item>
+                    <Form.Item
+                      name="isEnabled"
+                      label={t('scheduleTask.isEnabled')}
+                      valuePropName="checked"
+                      className="mb-4"
+                    >
+                      <Switch checkedChildren={t('scheduleTask.enabled')} unCheckedChildren={t('scheduleTask.disabled')} />
+                    </Form.Item>
+                  </>
+                ),
+              },
+              {
+                key: 'config',
+                label: t('scheduleTask.tabConfig'),
+                forceRender: true,
+                children: (
+                  <Form.Item noStyle shouldUpdate={(prev, cur) => prev.jobType !== cur.jobType}>
+                    {() => {
+                      const currentJobType = form.getFieldValue('jobType')
+                      const jobInfo = availableJobTypes.find(j => j.jobType === currentJobType)
+                      const schema = jobInfo?.configSchema || []
+
+                      if (schema.length === 0) {
+                        return (
+                          <Empty
+                            image={Empty.PRESENTED_IMAGE_SIMPLE}
+                            description={t('scheduleTask.noConfig')}
+                          />
+                        )
+                      }
+
+                      return schema.map(item => renderConfigFormItem(item))
+                    }}
+                  </Form.Item>
+                ),
+              },
+            ]}
+          />
         </Form>
       </Modal>
     </div>

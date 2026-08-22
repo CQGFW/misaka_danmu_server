@@ -9,8 +9,8 @@ import httpx
 from pydantic import BaseModel, Field
 from fastapi import HTTPException, Request
 
-from .. import models
-from .. import crud
+from src.db import models
+from src.db import crud
 from .base import BaseMetadataSource
 
 logger = logging.getLogger(__name__)
@@ -106,6 +106,11 @@ class ImdbApiDevListTitleAKAsResponse(BaseModel):
     akas: List[ImdbApiDevAka]
 
 
+class CloudflareBlockedError(Exception):
+    """Raised when Cloudflare blocks the request (403)"""
+    pass
+
+
 class ImdbApiDevClient:
     """Client for Third-Party IMDb API (api.imdbapi.dev)"""
     BASE_URL = 'https://api.imdbapi.dev'
@@ -115,23 +120,44 @@ class ImdbApiDevClient:
         self.logger = logging.getLogger(self.__class__.__name__)
 
     async def _make_request(self, path: str, params: Optional[dict] = None) -> Optional[dict]:
-        """Make a request to the IMDb API"""
+        """Make a request to the IMDb API
+
+        Raises:
+            CloudflareBlockedError: When Cloudflare returns 403 (usually due to geo-blocking)
+        """
         try:
             headers = {
                 "Accept": "application/json",
-                "User-Agent": "DanmuApiServer/1.0"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             }
             async with httpx.AsyncClient(
-                timeout=10.0,
+                timeout=15.0,
                 proxy=self.proxy_url,
                 follow_redirects=True,
                 headers=headers
             ) as client:
                 response = await client.get(f"{self.BASE_URL}{path}", params=params)
+
+                # Check for Cloudflare block (403 with challenge page)
+                if response.status_code == 403:
+                    content_type = response.headers.get("content-type", "")
+                    if "text/html" in content_type:
+                        # Cloudflare challenge page detected
+                        self.logger.warning(f"IMDb API blocked by Cloudflare (403): {path}")
+                        raise CloudflareBlockedError("Cloudflare blocked the request - try using a US proxy")
+                    else:
+                        self.logger.warning(f"IMDb API returned 403: {path}")
+                        return None
+
                 if response.status_code != 200:
                     self.logger.warning(f"IMDb API request failed: {path}, status: {response.status_code}")
                     return None
                 return response.json()
+        except CloudflareBlockedError:
+            raise  # Re-raise Cloudflare errors
+        except httpx.TimeoutException:
+            self.logger.warning(f"IMDb API request timeout: {path}")
+            raise CloudflareBlockedError("Request timeout - Cloudflare may be blocking or network issue")
         except Exception as e:
             self.logger.error(f"IMDb API request error: {e}")
             return None
@@ -179,6 +205,8 @@ class ImdbApiDevClient:
 
 class ImdbMetadataSource(BaseMetadataSource):
     provider_name = "imdb"
+    config_keys = ["imdbUseApi", "imdbEnableFallback"]
+    bool_config_keys = ["imdbUseApi", "imdbEnableFallback"]
     test_url = "https://www.imdb.com"
 
     # 配置字段 (格式: "config_key": ("UI标签", "字段类型", "提示信息"))
@@ -228,16 +256,28 @@ class ImdbMetadataSource(BaseMetadataSource):
     async def _get_html_client(self) -> httpx.AsyncClient:
         """Get or create the HTML parsing client"""
         if self._html_client is None:
-            proxy_url = await self.config_manager.get("proxyUrl", "")
-            proxy_enabled_globally = (await self.config_manager.get("proxyEnabled", "false")).lower() == 'true'
+            # 获取代理模式
+            proxy_mode = await self.config_manager.get("proxyMode", "none")
 
-            async with self._session_factory() as session:
-                metadata_settings = await crud.get_all_metadata_source_settings(session)
+            # 兼容旧配置：如果 proxyMode 为 none 但 proxyEnabled 为 true，则使用 http_socks 模式
+            if proxy_mode == "none":
+                proxy_enabled_globally = (await self.config_manager.get("proxyEnabled", "false")).lower() == 'true'
+                if proxy_enabled_globally:
+                    proxy_mode = "http_socks"
 
-            provider_setting = next((s for s in metadata_settings if s['providerName'] == self.provider_name), None)
-            use_proxy_for_this_provider = provider_setting.get('useProxy', False) if provider_setting else False
+            proxy_to_use = None
 
-            proxy_to_use = proxy_url if proxy_enabled_globally and use_proxy_for_this_provider and proxy_url else None
+            # 只有 http_socks 模式才需要设置 httpx 的 proxy 参数
+            if proxy_mode == "http_socks":
+                proxy_url = await self.config_manager.get("proxyUrl", "")
+                if proxy_url:
+                    async with self._session_factory() as session:
+                        metadata_settings = await crud.get_all_metadata_source_settings(session)
+
+                    provider_setting = next((s for s in metadata_settings if s['providerName'] == self.provider_name), None)
+                    use_proxy_for_this_provider = provider_setting.get('useProxy', False) if provider_setting else False
+
+                    proxy_to_use = proxy_url if use_proxy_for_this_provider else None
 
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -394,11 +434,12 @@ class ImdbMetadataSource(BaseMetadataSource):
             return None
 
     async def _search_via_api(self, keyword: str, mediaType: Optional[str] = None) -> List[models.MetadataDetailsResponse]:
-        """使用第三方API搜索 (api.imdbapi.dev) - 暂时禁用,因为CORS限制"""
-        self.logger.warning(f"IMDb: 第三方API暂时禁用(CORS限制),跳过API搜索")
-        return []
+        """使用第三方API搜索 (api.imdbapi.dev)
 
-        # 以下代码保留,待API可用时启用
+        Raises:
+            CloudflareBlockedError: When Cloudflare blocks the request
+        """
+        self.logger.info(f"IMDb: 正在使用第三方API搜索 '{keyword}'")
         formatted_keyword = keyword.strip()
         if not formatted_keyword:
             return []
@@ -439,12 +480,18 @@ class ImdbMetadataSource(BaseMetadataSource):
 
             return results
 
+        except CloudflareBlockedError:
+            raise  # Re-raise to trigger fallback
         except Exception as e:
             self.logger.error(f"IMDb 第三方API 搜索失败: {e}")
             raise HTTPException(status_code=500, detail=f"IMDb 第三方API 搜索失败: {str(e)}")
 
     async def _get_details_via_api(self, item_id: str, mediaType: Optional[str] = None) -> Optional[models.MetadataDetailsResponse]:
-        """使用第三方API获取详情 (api.imdbapi.dev)"""
+        """使用第三方API获取详情 (api.imdbapi.dev)
+
+        Raises:
+            CloudflareBlockedError: When Cloudflare blocks the request
+        """
         self.logger.info(f"IMDb: 正在使用第三方API获取详情 item_id={item_id}")
 
         try:
@@ -482,12 +529,14 @@ class ImdbMetadataSource(BaseMetadataSource):
                 imageUrl=title.primary_image.url if title.primary_image else None
             )
 
+        except CloudflareBlockedError:
+            raise  # Re-raise to trigger fallback
         except Exception as e:
             self.logger.error(f"获取 IMDb 第三方API详情时发生错误: {e}")
             return None
 
     async def search(self, keyword: str, user: models.User, mediaType: Optional[str] = None) -> List[models.MetadataDetailsResponse]:
-        """搜索标题 (支持双模式和兜底)"""
+        """搜索标题 (支持双模式和兜底，遇到Cloudflare 403自动降级)"""
         use_api = await self._get_config("useApi", True)
         enable_fallback = await self._get_config("enableFallback", True)
 
@@ -510,6 +559,18 @@ class ImdbMetadataSource(BaseMetadataSource):
                 except Exception as fallback_e:
                     self.logger.warning(f"兜底方式也失败: {fallback_e}")
             return results
+        except CloudflareBlockedError as cf_e:
+            # Cloudflare 阻止，自动降级到 HTML 解析
+            if enable_fallback:
+                self.logger.warning(f"Cloudflare阻止API访问,自动降级到HTML解析: {cf_e}")
+                try:
+                    return await self._search_via_html(keyword, mediaType)
+                except Exception as fallback_e:
+                    self.logger.error(f"HTML解析也失败: {fallback_e}")
+                    raise
+            else:
+                self.logger.error(f"Cloudflare阻止API访问,且未启用兜底: {cf_e}")
+                raise HTTPException(status_code=503, detail="IMDb API被Cloudflare阻止,请启用兜底或使用美国代理")
         except Exception as e:
             if enable_fallback:
                 fallback_name = "官方HTML" if use_api else "第三方API"
@@ -523,7 +584,7 @@ class ImdbMetadataSource(BaseMetadataSource):
                 raise
 
     async def get_details(self, item_id: str, user: models.User, mediaType: Optional[str] = None) -> Optional[models.MetadataDetailsResponse]:
-        """获取详情 (支持双模式和兜底)"""
+        """获取详情 (支持双模式和兜底，遇到Cloudflare 403自动降级)"""
         use_api = await self._get_config("useApi", True)
         enable_fallback = await self._get_config("enableFallback", True)
 
@@ -538,6 +599,18 @@ class ImdbMetadataSource(BaseMetadataSource):
                 self.logger.warning(f"主详情方式返回空,尝试兜底方式")
                 return await fallback_method(item_id, mediaType)
             else:
+                return None
+        except CloudflareBlockedError as cf_e:
+            # Cloudflare 阻止，自动降级到 HTML 解析
+            if enable_fallback:
+                self.logger.warning(f"Cloudflare阻止API访问,自动降级到HTML解析: {cf_e}")
+                try:
+                    return await self._get_details_via_html(item_id, mediaType)
+                except Exception as fallback_e:
+                    self.logger.error(f"HTML解析也失败: {fallback_e}")
+                    return None
+            else:
+                self.logger.error(f"Cloudflare阻止API访问,且未启用兜底: {cf_e}")
                 return None
         except Exception as e:
             if enable_fallback:
@@ -574,10 +647,17 @@ class ImdbMetadataSource(BaseMetadataSource):
 
         return {alias for alias in local_aliases if alias}
 
-    async def check_connectivity(self) -> str:
+    async def check_connectivity(self) -> Dict[str, str]:
         """检查IMDb源配置状态"""
-        # IMDb源不需要特殊配置，只要能正常运行即可
-        return "配置正常 (无需特殊配置)"
+        try:
+            use_api = await self._get_config("useApi", True)
+            enable_fallback = await self._get_config("enableFallback", True)
+
+            mode = "第三方API模式 (api.imdbapi.dev)" if use_api else "官方HTML解析模式"
+            fallback = "，失败时自动切换" if enable_fallback else ""
+            return {"code": "ok", "message": f"{mode}{fallback}"}
+        except Exception as e:
+            return {"code": "error", "message": f"配置检查失败: {e}"}
 
     async def execute_action(self, action_name: str, payload: Dict[str, Any], user: models.User, request: Request) -> Any:
         """IMDb source does not support custom actions."""

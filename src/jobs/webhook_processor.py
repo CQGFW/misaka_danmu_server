@@ -1,26 +1,31 @@
-import asyncio
 import logging
 import json
 from typing import Callable
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import crud
-from ..tasks import webhook_search_and_dispatch_task
+from src.db import crud
+from src.tasks import webhook_search_and_dispatch_task
 from .base import BaseJob
+from src.utils.task_profiler import profile_flow, FLOW_WEBHOOK_PROCESSOR
 
 logger = logging.getLogger(__name__)
 
 class WebhookProcessorJob(BaseJob):
     job_type = "webhookProcessor"
     job_name = "Webhook 延时任务处理器"
+    job_name_en = "Webhook Delayed Task Processor"
+    job_name_tw = "Webhook 延時任務處理器"
     description = "定期检查并处理来自Emby/Jellyfin等媒体服务器的延时Webhook请求，自动导入新增的剧集弹幕。"
+    description_en = "Periodically check and process delayed Webhook requests from media servers (Emby/Jellyfin), auto-importing new episode danmaku."
+    description_tw = "定期檢查並處理來自Emby/Jellyfin等媒體伺服器的延時Webhook請求，自動匯入新增的劇集彈幕。"
 
+    @profile_flow(FLOW_WEBHOOK_PROCESSOR)
     async def run(self, session: AsyncSession, progress_callback: Callable):
         """
         执行 Webhook 延时任务处理。
         """
         await progress_callback(0, "开始检查待处理的 Webhook 任务...")
-        
+
         due_tasks = await crud.get_due_webhook_tasks(session)
         if not due_tasks:
             await progress_callback(100, "没有需要处理的 Webhook 任务。")
@@ -40,8 +45,9 @@ class WebhookProcessorJob(BaseJob):
                     payload = json.loads(payload)
 
                 # 使用 webhook_search_and_dispatch_task 的逻辑
-                task_coro = lambda s, cb: webhook_search_and_dispatch_task(
-                    webhookSource=task.webhookSource,
+                # 使用默认参数 t=task, p=payload 捕获当前循环变量的值,避免闭包问题
+                task_coro = lambda s, cb, t=task, p=payload: webhook_search_and_dispatch_task(
+                    webhookSource=t.webhookSource,
                     progress_callback=cb,
                     session=s,
                     manager=self.scraper_manager,
@@ -51,17 +57,17 @@ class WebhookProcessorJob(BaseJob):
                     ai_matcher_manager=self.ai_matcher_manager,
                     rate_limiter=self.rate_limiter,
                     title_recognition_manager=self.title_recognition_manager,
-                    **payload
+                    **p
                 )
-                # 修正：使用 run_immediately=True 来串行执行任务，避免并发冲突
-                # 这样每个任务都会立即执行并完成，而不是加入队列等待
-                task_id, done_event = await self.task_manager.submit_task(
-                    task_coro, task.taskTitle, unique_key=task.uniqueKey, run_immediately=True
+                # 修正：不使用 run_immediately，让任务正常进入队列
+                # 这样任务可以正确处理流控暂停和恢复
+                task_id, _ = await self.task_manager.submit_task(
+                    task_coro, task.taskTitle, unique_key=task.uniqueKey
                 )
-                # 等待任务完成
-                await done_event.wait()
-                # 修正：只有在任务成功提交并完成后才删除记录
+                # 修正：不等待任务完成，直接删除 webhook 记录
+                # 任务会在队列中正常执行，不会因为流控暂停而卡住
                 await session.delete(task)
+                logger.info(f"Webhook 任务 '{task.taskTitle}' 已提交到任务队列 (ID: {task_id})")
 
             except Exception as e:
                 logger.error(f"处理 Webhook 任务 (ID: {task.id}) 时失败: {e}", exc_info=True)

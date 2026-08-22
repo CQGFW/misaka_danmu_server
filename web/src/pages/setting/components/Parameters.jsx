@@ -1,110 +1,144 @@
-import { Button, Card, Form, Input, message, Space, Tag } from 'antd'
-import { CheckCircleOutlined, CloseCircleOutlined } from '@ant-design/icons'
+import { Empty, Spin, Tabs } from 'antd'
 import { useState, useEffect } from 'react'
+import { useAtomValue } from 'jotai'
+import { isMobileAtom } from '../../../../store'
 import {
+  getConfigSchema,
   getGithubToken,
   saveGithubToken,
   verifyGithubToken,
 } from '../../../apis'
+import { GenericConfigItem } from './GenericConfigItem'
+import { DatabaseBackupManager } from './DatabaseBackupManager'
+import { DatabaseInfoPanel } from './DatabaseInfoPanel'
+import { SortablePriorityList } from '../../../components/SortablePriorityList'
+import { useTranslation } from 'react-i18next'
+import { getLocalizedField } from '../../../utils/i18nDynamic'
+
+// GitHub Token 的特殊配置（使用自定义 API）
+const GITHUB_TOKEN_CONFIG = {
+  key: 'github_token',
+  getApi: getGithubToken,
+  saveApi: saveGithubToken,
+  verifyApi: verifyGithubToken,
+}
+
+// 需要渲染自定义组件的分组（旧格式兼容）
+const CUSTOM_COMPONENTS_BY_KEY = {
+  database: DatabaseBackupManager,
+}
+
+// 通用组件类型映射（新格式）
+const CUSTOM_COMPONENT_TYPES = {
+  SortablePriorityList: SortablePriorityList,
+  DatabaseBackupManager: DatabaseBackupManager,
+}
 
 export const Parameters = () => {
-  const [form] = Form.useForm()
-  const [messageApi, contextHolder] = message.useMessage()
-  const [loading, setLoading] = useState(false)
-  const [tokenInfo, setTokenInfo] = useState(null)
+  const { t } = useTranslation()
+  const [schema, setSchema] = useState([])
+  const [loading, setLoading] = useState(true)
+  const isMobile = useAtomValue(isMobileAtom)
 
   useEffect(() => {
-    loadGithubToken()
+    loadSchema()
   }, [])
 
-  const loadGithubToken = async () => {
-    try {
-      const res = await getGithubToken()
-      form.setFieldsValue({
-        githubToken: res.data?.token || '',
-      })
-      if (res.data?.token) {
-        await verifyToken(res.data.token)
-      }
-    } catch (error) {
-      console.error('加载GitHub Token失败:', error)
-    }
-  }
-
-  const verifyToken = async (token) => {
-    if (!token) {
-      setTokenInfo(null)
-      return
-    }
-    try {
-      const res = await verifyGithubToken({ token })
-      setTokenInfo(res.data)
-    } catch (error) {
-      setTokenInfo({ valid: false, error: error.response?.data?.detail || '验证失败' })
-    }
-  }
-
-  const handleSave = async () => {
+  const loadSchema = async () => {
     try {
       setLoading(true)
-      const values = await form.validateFields()
-      await saveGithubToken({ token: values.githubToken })
-      messageApi.success('保存成功')
-      await verifyToken(values.githubToken)
-    } catch (error) {
-      messageApi.error(error.response?.data?.detail || '保存失败')
+      const res = await getConfigSchema()
+      setSchema(res.data || [])
+    } catch (err) {
+      console.error('加载配置 Schema 失败:', err)
+      setSchema([])
     } finally {
       setLoading(false)
     }
   }
 
+  // 为特殊配置项注入自定义 API
+  const enrichConfig = (config) => {
+    if (config.key === 'github_token') {
+      return { ...config, ...GITHUB_TOKEN_CONFIG }
+    }
+    return config
+  }
+
+  if (loading) {
+    return (
+      <div className="flex justify-center items-center py-12">
+        <Spin tip={t('parameters.loading')} />
+      </div>
+    )
+  }
+
+  if (!schema || schema.length === 0) {
+    return (
+      <Empty
+        description={t('parameters.noConfig')}
+        className="py-12"
+      />
+    )
+  }
+
+  // 构建 Tabs 的 items
+  const tabItems = schema.map((group) => {
+    // 解析自定义组件配置
+    let CustomComponent = null
+    let customComponentProps = {}
+
+    // 新格式：customComponent 是对象 { type, props }
+    if (group.customComponent && typeof group.customComponent === 'object') {
+      CustomComponent = CUSTOM_COMPONENT_TYPES[group.customComponent.type]
+      const rawProps = group.customComponent.props || {}
+      // 本地化 props 中的文本字段
+      customComponentProps = {
+        ...rawProps,
+        title: getLocalizedField(rawProps, 'title'),
+        description: getLocalizedField(rawProps, 'description'),
+        tips: getLocalizedField(rawProps, 'tips'),
+        // 本地化 availableItems 中的 name/description
+        availableItems: rawProps.availableItems?.map(item => ({
+          ...item,
+          name: getLocalizedField(item, 'name'),
+          description: getLocalizedField(item, 'description'),
+        })),
+      }
+    }
+    // 旧格式兼容：通过 group.key 匹配
+    else if (CUSTOM_COMPONENTS_BY_KEY[group.key]) {
+      CustomComponent = CUSTOM_COMPONENTS_BY_KEY[group.key]
+    }
+    // 旧格式兼容：customComponent 是字符串
+    else if (typeof group.customComponent === 'string') {
+      CustomComponent = CUSTOM_COMPONENT_TYPES[group.customComponent]
+    }
+
+    return {
+      key: group.key,
+      label: getLocalizedField(group, 'label'),
+      children: (
+        <div className="py-2 pb-4">
+          {/* 数据库标签页顶部显示连接信息 */}
+          {group.key === 'database' && <DatabaseInfoPanel />}
+          {group.items?.map((item) => (
+            <GenericConfigItem key={item.key} config={enrichConfig(item)} />
+          ))}
+          {/* 渲染自定义组件 */}
+          {CustomComponent && <CustomComponent {...customComponentProps} />}
+        </div>
+      ),
+    }
+  })
+
   return (
-    <div>
-      {contextHolder}
-      <Card title="GitHub Token 配置" className="mb-4">
-        <Form form={form} layout="vertical">
-          <Form.Item
-            name="githubToken"
-            label="GitHub Personal Access Token"
-            extra="用于请求 GitHub API,避免速率限制。无需任何权限,只需创建一个 Token 即可。"
-          >
-            <Input.Password
-              placeholder="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-              onChange={(e) => verifyToken(e.target.value)}
-            />
-          </Form.Item>
-
-          {tokenInfo && (
-            <div className="mb-4">
-              {tokenInfo.valid ? (
-                <Space direction="vertical" className="w-full">
-                  <Tag icon={<CheckCircleOutlined />} color="success">
-                    Token 有效
-                  </Tag>
-                  <div className="text-sm text-gray-600">
-                    <div>用户: {tokenInfo.username}</div>
-                    <div>剩余配额: {tokenInfo.rateLimit?.remaining} / {tokenInfo.rateLimit?.limit}</div>
-                    <div>重置时间: {new Date(tokenInfo.rateLimit?.reset * 1000).toLocaleString()}</div>
-                  </div>
-                </Space>
-              ) : (
-                <Tag icon={<CloseCircleOutlined />} color="error">
-                  {tokenInfo.error || 'Token 无效'}
-                </Tag>
-              )}
-            </div>
-          )}
-
-          <Form.Item>
-            <Button type="primary" onClick={handleSave} loading={loading}>
-              保存
-            </Button>
-          </Form.Item>
-        </Form>
-      </Card>
-
-
-    </div>
+    <Tabs
+      defaultActiveKey={schema[0]?.key}
+      items={tabItems}
+      tabPosition={isMobile ? 'top' : 'left'}
+      className="parameters-tabs"
+    />
   )
 }
 

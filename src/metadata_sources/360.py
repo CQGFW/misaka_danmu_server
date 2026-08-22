@@ -8,10 +8,9 @@ import httpx
 from bs4 import BeautifulSoup # type: ignore
 from pydantic import BaseModel, Field
 
-from .. import models
-from ..config_manager import ConfigManager
+from src.db import models, ConfigManager, CacheManager
 from .base import BaseMetadataSource
-from ..scrapers.base import get_season_from_title
+from src.scrapers.base import get_season_from_title
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +66,30 @@ class So360MetadataSource(BaseMetadataSource):
     is_failover_source = True
     has_force_aux_search_toggle = True
     supports_episode_urls = True  # 360源支持获取分集URL
+    is_search_supplement_source = True  # 360源作为搜索补充源
 
-    def __init__(self, session_factory, config_manager: ConfigManager, scraper_manager):
-        super().__init__(session_factory, config_manager, scraper_manager)
+    configurable_fields = {
+        "searchSupplementEnabled": ("启用搜索补充", "boolean", "启用后，当弹幕源搜索无结果时，将通过360影视为其补充搜索结果"),
+    }
+
+    # 360内部平台名 -> 本项目弹幕源 provider name
+    # 注意：360 API 实际返回的 bilibili key 是 "bilibili1"，不是 "bilibili"
+    PLATFORM_TO_PROVIDER: Dict[str, str] = {
+        "qq": "tencent",
+        "qiyi": "iqiyi",
+        "youku": "youku",
+        "bilibili1": "bilibili",
+        "imgo": "mgtv",
+        "migu": "migu",
+        "sohu": "sohu",
+        "leshi": "le",
+        "xigua": "xigua",
+    }
+    # 反向映射: 本项目弹幕源 provider name -> 360内部平台名（列表，因为一个 provider 可能对应多个 key）
+    PROVIDER_TO_PLATFORMS: Dict[str, List[str]] = {}
+
+    def __init__(self, session_factory, config_manager: ConfigManager, scraper_manager, cache_manager: CacheManager):
+        super().__init__(session_factory, config_manager, scraper_manager, cache_manager)
         self.api_base_url = "https://api.so.360kan.com"
         self.web_base_url = "https://www.360kan.com"
 
@@ -95,14 +115,70 @@ class So360MetadataSource(BaseMetadataSource):
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
         }
 
-        self.client = httpx.AsyncClient(
-            headers=self.headers,
-            cookies=self.cookies,
-            timeout=20.0,
-        )
+        self.client = None  # 延迟初始化，支持代理配置
+
+    async def _get_proxy(self) -> Optional[str]:
+        """当 360 元数据源开启 useProxy 时，返回代理 URL。"""
+        proxy_mode = await self.config_manager.get("proxyMode", "none")
+        if proxy_mode == "none":
+            if (await self.config_manager.get("proxyEnabled", "false")).lower() == "true":
+                proxy_mode = "http_socks"
+        if proxy_mode != "http_socks":
+            return None
+        proxy_url = await self.config_manager.get("proxyUrl", "")
+        if not proxy_url:
+            return None
+        async with self._session_factory() as session:
+            from src.db import crud as _crud
+            all_settings = await _crud.get_all_metadata_source_settings(session)
+            setting = next((s for s in all_settings if s.get('providerName') == '360'), None)
+            if setting and setting.get('useProxy', False):
+                return proxy_url
+        return None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        """获取或创建 httpx client，支持代理。"""
+        if self.client is None:
+            proxy = await self._get_proxy()
+            self.client = httpx.AsyncClient(
+                headers=self.headers,
+                cookies=self.cookies,
+                timeout=20.0,
+                proxy=proxy,
+            )
+        return self.client
 
     async def search(self, keyword: str, user: models.User, mediaType: Optional[str] = None) -> List[models.MetadataDetailsResponse]:
-        """基于参考实现的简化搜索方法"""
+        """基于参考实现的简化搜索方法（使用 CacheManager 缓存避免短期内重复请求）"""
+        await self._get_client()  # 确保 client 已初始化
+        cache_prefix = "360_search_"
+        cache_key = keyword
+
+        # 检查 CacheManager 缓存（60秒有效）
+        try:
+            cached = await self.cache_manager.get(cache_prefix, cache_key)
+            if cached and isinstance(cached, list):
+                self.logger.info(f"360搜索: {keyword} (缓存命中)")
+                return [models.MetadataDetailsResponse(**item) for item in cached]
+        except Exception as e:
+            self.logger.debug(f"360搜索: 读取缓存失败: {e}")
+
+        # 执行实际搜索
+        results = await self._do_search(keyword)
+
+        # 存入缓存（60秒）
+        try:
+            cache_data = [r.model_dump() for r in results]
+            await self.cache_manager.set(cache_prefix, cache_key, cache_data, ttl_seconds=60)
+        except Exception as e:
+            self.logger.debug(f"360搜索: 写入缓存失败: {e}")
+
+        return results
+
+    async def _do_search(self, keyword: str) -> List[models.MetadataDetailsResponse]:
+        """360 实际搜索逻辑"""
+        import asyncio as _asyncio
+
         search_url = f"{self.api_base_url}/index"
         params = {
             'force_v': '1',
@@ -169,6 +245,8 @@ class So360MetadataSource(BaseMetadataSource):
             results: List[models.MetadataDetailsResponse] = []
             skip_keywords = ["花絮", "独家专访", "幕后", "专访", "无障碍", "路演"]
 
+            # 先收集所有候选条目（不做 probe）
+            candidates = []
             for item in rows:
                 title = item.get('titleTxt', '')
 
@@ -191,6 +269,34 @@ class So360MetadataSource(BaseMetadataSource):
 
                 media_id = item.get('en_id') or item.get('id', '')
 
+                # 缓存原始搜索结果到数据库 - 用于后续获取分集时使用
+                try:
+                    await self.cache_manager.set("360_search_item_", str(media_id), item, ttl_seconds=10800)  # 3小时
+                except Exception as e:
+                    self.logger.warning(f"360: 缓存搜索结果失败 (media_id={media_id}): {e}")
+
+                candidates.append((item, media_id, title, media_type))
+
+            # 并行探测所有候选条目支持的平台
+            import asyncio as _asyncio
+            probe_tasks = [
+                self._probe_supported_providers(item, media_id, title)
+                for item, media_id, title, _ in candidates
+            ]
+            probe_results = await _asyncio.gather(*probe_tasks, return_exceptions=True)
+
+            # 组装最终结果
+            for i, (item, media_id, title, media_type) in enumerate(candidates):
+                probe_result = probe_results[i]
+                supported_providers = probe_result if isinstance(probe_result, dict) else {}
+
+                # 将支持的平台列表和集数存储到extra中
+                extra_data = {"item_data": item}
+                if supported_providers:
+                    extra_data["supported_providers"] = list(supported_providers.keys())
+                    extra_data["provider_episode_counts"] = supported_providers
+                    self.logger.debug(f"360: {title} 支持的平台: {supported_providers}")
+
                 results.append(models.MetadataDetailsResponse(
                     id=str(media_id),
                     provider=self.provider_name,
@@ -199,11 +305,18 @@ class So360MetadataSource(BaseMetadataSource):
                     imageUrl=item.get('cover'),
                     year=int(item['year']) if item.get('year') and str(item['year']).isdigit() else None,
                     aliasesCn=item.get('alias', []),
-                    extra={"item_data": item},  # 保存原始数据用于后续处理
-                    supportsEpisodeUrls=True  # 360源支持获取分集URL
+                    extra=extra_data,
+                    supportsEpisodeUrls=bool(supported_providers)
                 ))
 
             self.logger.info(f"360搜索: 过滤后返回 {len(results)} 个结果")
+            if results:
+                result_lines = ["360搜索: 搜索结果列表:"]
+                for r in results:
+                    platforms = r.extra.get("supported_providers", []) if r.extra else []
+                    platforms_str = ", ".join(platforms) if platforms else "无"
+                    result_lines.append(f"    - {r.title} (ID: {r.id}, 类型: {r.type}, 年份: {r.year or 'N/A'}, 平台: {platforms_str})")
+                self.logger.info("\n".join(result_lines))
             return results
 
         except httpx.ConnectError as e:
@@ -218,7 +331,7 @@ class So360MetadataSource(BaseMetadataSource):
 
     async def find_url_for_provider(self, keyword: str, target_provider: str, user: models.User, season: Optional[int] = None, episode_index: Optional[int] = None) -> Optional[str]:
         """通过360搜索查找指定平台（如腾讯、B站）的播放链接。"""
-        provider_map = { "tencent": "qq", "iqiyi": "qiyi", "youku": "youku", "bilibili": "bilibili", "mgtv": "imgo" }
+        provider_map = { "tencent": "qq", "iqiyi": "qiyi", "youku": "youku", "bilibili": "bilibili1", "mgtv": "imgo" }
         target_site = provider_map.get(target_provider)
         if not target_site:
             self.logger.debug(f"360故障转移：不支持的目标平台 '{target_provider}'")
@@ -245,6 +358,7 @@ class So360MetadataSource(BaseMetadataSource):
         return await self._get_episode_url_from_360(best_match, episode_index, target_site)
 
     async def get_details(self, item_id: str, user: models.User, mediaType: Optional[str] = None) -> Optional[models.MetadataDetailsResponse]:
+        await self._get_client()
         possible_paths = [f"/dianshiju/{item_id}.html", f"/dongman/{item_id}.html", f"/dianying/{item_id}.html"]
         try:
             for path in possible_paths:
@@ -543,54 +657,124 @@ class So360MetadataSource(BaseMetadataSource):
             self.logger.error(f"360: 获取条目信息失败: {e}", exc_info=True)
             return None
 
-    async def get_episode_urls(self, metadata_id: str, target_provider: Optional[str] = None) -> List[Tuple[int, str]]:
+    async def get_episode_urls(self, metadata_id: str, target_provider: Optional[str] = None, item_data: Optional[dict] = None) -> List[Tuple[int, str]]:
         """
         获取分集URL列表 (补充源功能)。
 
         Args:
             metadata_id: 360影视条目ID
             target_provider: 目标平台 (tencent/iqiyi/youku/bilibili/mgtv), 如果为None则返回所有平台
+            item_data: 可选的搜索结果原始数据,如果提供则直接使用,避免重新查询
 
         Returns:
             List[Tuple[int, str]]: (集数, 播放URL) 的列表
         """
+        await self._get_client()
         try:
-            # 1. 获取条目信息
-            item = await self._get_item_info_by_id(metadata_id)
-            if not item:
-                self.logger.warning(f"360: 无法获取条目信息 (metadata_id={metadata_id})")
-                return []
+            # 1. 获取条目信息 - 优先级: item_data > 数据库缓存 > 重新查询
+            if item_data:
+                self.logger.info(f"360: 使用传入的原始数据")
+                item = So360SearchResultItem(**item_data)
+            else:
+                # 尝试从数据库缓存读取
+                cached_item = None
+                try:
+                    cached_item = await self.cache_manager.get("360_search_item_", metadata_id)
+                except Exception as e:
+                    self.logger.warning(f"360: 读取缓存失败: {e}")
+
+                if cached_item:
+                    self.logger.info(f"360: 使用数据库缓存的搜索结果")
+                    item = So360SearchResultItem(**cached_item)
+                else:
+                    self.logger.info(f"360: 缓存未命中,通过ID查询条目信息")
+                    item = await self._get_item_info_by_id(metadata_id)
+                    if not item:
+                        self.logger.warning(f"360: 无法获取条目信息 (metadata_id={metadata_id})")
+                        return []
+                    # 查询成功后回写缓存，避免下次再重复查询
+                    try:
+                        item_dict = item.model_dump() if hasattr(item, 'model_dump') else item.__dict__
+                        await self.cache_manager.set("360_search_item_", str(metadata_id), item_dict, ttl_seconds=10800)  # 3小时
+                        self.logger.info(f"360: 已将查询结果回写缓存 (metadata_id={metadata_id})")
+                    except Exception as e:
+                        self.logger.warning(f"360: 回写缓存失败: {e}")
 
             # 2. 转换provider名称到360的site名称
-            provider_map = { "tencent": "qq", "iqiyi": "qiyi", "youku": "youku", "bilibili": "bilibili", "mgtv": "imgo" }
+            provider_map = { "tencent": "qq", "iqiyi": "qiyi", "youku": "youku", "bilibili": "bilibili1", "mgtv": "imgo" }
             target_site = provider_map.get(target_provider) if target_provider else None
 
-            # 3. 使用360 API获取分集列表
+            # 3. 优先使用搜索结果中的seriesPlaylinks (仅当平台匹配时)
+            if item.seriesPlaylinks and item.seriesSite:
+                # 检查seriesSite是否匹配target_site
+                if target_site and item.seriesSite == target_site:
+                    self.logger.info(f"360: 使用搜索结果中的seriesPlaylinks (平台={item.seriesSite}, 共 {len(item.seriesPlaylinks)} 个分集)")
+                    episode_urls = []
+                    for i, episode in enumerate(item.seriesPlaylinks):
+                        if isinstance(episode, dict):
+                            episode_url = episode.get('url', '')
+                        elif isinstance(episode, str):
+                            episode_url = item.playlinks.get(item.seriesSite, '') if item.playlinks else ''
+                        else:
+                            continue
+                        if episode_url:
+                            episode_urls.append((i + 1, episode_url))
+
+                    self.logger.info(f"360: 从seriesPlaylinks提取到 {len(episode_urls)} 个分集URL")
+                    return episode_urls
+                else:
+                    self.logger.info(f"360: seriesPlaylinks平台不匹配 (seriesSite={item.seriesSite}, target_site={target_site}), 使用API获取")
+            elif item.seriesPlaylinks:
+                # 有seriesPlaylinks但没有seriesSite,或者没有指定target_site
+                self.logger.info(f"360: seriesPlaylinks可用但无法确定平台匹配 (seriesSite={item.seriesSite}, target_site={target_site}), 使用API获取")
+
+            # 4. 使用360 API获取分集列表
             cat_id = item.cat_id or ''
             cat_name = item.cat_name or ''
 
+            # 判断是否为电影（cat_id=1 或 无seriesPlaylinks 或 seriesPlaylinks<=1集）
+            is_movie = (cat_id == '1') or (
+                not item.seriesPlaylinks or len(item.seriesPlaylinks) <= 1
+            ) and cat_id not in ('2', '3', '4')
+
             # 确定使用哪个平台
-            if target_site:
-                site = target_site
-            else:
+            if not target_site:
                 # 如果没有指定平台,使用第一个可用平台
                 if item.playlinks:
-                    site = list(item.playlinks.keys())[0]
+                    target_site = list(item.playlinks.keys())[0]
                 else:
                     self.logger.warning(f"360: 没有可用的播放平台 (metadata_id={metadata_id})")
                     return []
 
-            # 4. 调用API获取分集
+            # 5. 电影：直接从playlinks取URL，不需要调episodesv2
+            if is_movie:
+                play_url = item.playlinks.get(target_site)
+                if play_url:
+                    if isinstance(play_url, str):
+                        url = self._convert_hunantv_to_mgtv(play_url)
+                    elif isinstance(play_url, list) and play_url:
+                        url = self._convert_hunantv_to_mgtv(play_url[0] if isinstance(play_url[0], str) else play_url[0].get('url', ''))
+                    elif isinstance(play_url, dict):
+                        url = self._convert_hunantv_to_mgtv(play_url.get('url', ''))
+                    else:
+                        url = ''
+                    if url:
+                        self.logger.info(f"360: 电影直接使用playlinks URL (平台={target_site})")
+                        return [(1, url)]
+                self.logger.warning(f"360: 电影在playlinks中未找到平台 {target_site} 的URL")
+                return []
+
+            # 6. 调用API获取分集（非电影）
             episode_urls: List[Tuple[int, str]] = []
 
             if cat_id == '3' or '综艺' in cat_name:
                 # 综艺使用episodeszongyi接口,使用id
                 ent_id = item.id
-                episode_urls = await self._get_zongyi_episodes(ent_id, site, item)
+                episode_urls = await self._get_zongyi_episodes(ent_id, target_site, item)
             else:
-                # 其他使用episodesv2接口,优先使用en_id
+                # 电视剧/动漫使用episodesv2接口,优先使用en_id
                 ent_id = item.en_id or item.id
-                episode_urls = await self._get_episodes_v2(cat_id, ent_id, site)
+                episode_urls = await self._get_episodes_v2(cat_id, ent_id, target_site)
 
             self.logger.info(f"360: 成功获取 {len(episode_urls)} 个分集URL")
             return episode_urls
@@ -631,7 +815,7 @@ class So360MetadataSource(BaseMetadataSource):
         try:
             # 综艺类型处理
             if cat_id == '3' or (item_data.get('cat_name') and '综艺' in item_data.get('cat_name', '')):
-                return await self._get_zongyi_episodes(ent_id, site, item_data)
+                return await self._get_zongyi_episodes_raw(ent_id, site, item_data)
             else:
                 # 电视剧/动漫处理
                 return await self._get_series_episodes(cat_id, en_id or ent_id, site)
@@ -639,18 +823,33 @@ class So360MetadataSource(BaseMetadataSource):
             self.logger.error(f"360获取分集失败 (site={site}): {e}")
             return []
 
-    async def _get_zongyi_episodes(self, ent_id: str, site: str, item_data: dict) -> List[Any]:
-        """获取综艺分集 (基于参考实现)"""
+    async def _get_zongyi_episodes_raw(self, ent_id: str, site: str, item_data: Any) -> List[Any]:
+        """获取综艺分集【原始字典列表】(基于参考实现，供 failover 链路使用)。
+
+        why：此方法返回 360 API 的原始分集 dict 列表（调用方 _get_episode_url_from_360
+        会自行从 dict 取 url）。而 get_episode_urls 用的是同名的 _get_zongyi_episodes
+        （返回 (集数,url) 2元组）——两者契约不同，故必须区分方法名，否则后定义会覆盖前者，
+        导致 get_episode_urls 拿到原始 dict、上层 `for idx, url in episode_urls` 解包报
+        'too many values to unpack (expected 2)'（表现为分集接口 403）。
+
+        兼容 dict 与 So360SearchResultItem(pydantic) 两种入参：用 _read 统一取值。
+        """
         all_episodes = []
+
+        def _read(key: str, default=None):
+            if isinstance(item_data, dict):
+                return item_data.get(key, default)
+            return getattr(item_data, key, default)
 
         # 获取年份列表
         years = []
-        if item_data.get('playlinks_year') and site in item_data['playlinks_year']:
-            years = [str(y) for y in item_data['playlinks_year'][site] if y]
-        elif item_data.get('years'):
-            years = [str(y) for y in item_data['years'] if y]
-        elif item_data.get('year'):
-            years = [str(item_data['year'])]
+        playlinks_year = _read('playlinks_year')
+        if playlinks_year and site in playlinks_year:
+            years = [str(y) for y in playlinks_year[site] if y]
+        elif _read('years'):
+            years = [str(y) for y in _read('years') if y]
+        elif _read('year'):
+            years = [str(_read('year'))]
 
         if not years:
             years = ['']
@@ -720,6 +919,146 @@ class So360MetadataSource(BaseMetadataSource):
 
         return []
 
+    async def _probe_supported_providers(self, item: dict, media_id: str, title: str) -> Dict[str, int]:
+        """
+        通过获取第一集分集URL来探测实际支持的平台。
+
+        Args:
+            item: 360搜索结果的原始数据
+            media_id: 媒体ID
+            title: 标题(用于日志)
+
+        Returns:
+            Dict[str, int]: 实际支持的平台 -> 分集数量 (tencent: 12, bilibili: 12, ...)
+        """
+        supported_providers: Dict[str, int] = {}
+
+        # 平台映射: 360内部名称 -> 标准名称（bilibili 在 360 API 中用 bilibili1）
+        provider_reverse_map = {"qq": "tencent", "qiyi": "iqiyi", "youku": "youku", "bilibili1": "bilibili", "imgo": "mgtv"}
+
+        cat_id = item.get('cat_id', '')
+        cat_name = item.get('cat_name', '')
+        ent_id = item.get('id', '')
+        en_id = item.get('en_id', '')
+        playlinks = item.get('playlinks', {})
+
+        # 只检查 playlinks 中存在的平台（bilibili 在 360 中是 bilibili1）
+        all_platforms = ['qq', 'qiyi', 'youku', 'bilibili1', 'imgo']
+        platforms_to_check = [site for site in all_platforms if site in playlinks]
+
+        if not platforms_to_check:
+            self.logger.debug(f"360探测: {title} 没有可用平台")
+            return supported_providers
+
+        self.logger.debug(f"360探测: {title} 检查平台: {platforms_to_check}")
+
+        for site in platforms_to_check:
+            try:
+                # 尝试获取第一集URL
+                # why：此处 item 为 dict 且下方按原始分集字典取 url（first_ep.get('url')），
+                # 需调用返回原始 dict 列表的 raw 版本，而非返回 (集数,url) 2元组的版本。
+                if cat_id == '3' or '综艺' in cat_name:
+                    episodes = await self._get_zongyi_episodes_raw(ent_id, site, item)
+                else:
+                    episodes = await self._get_series_episodes(cat_id, en_id or ent_id, site)
+
+                if episodes and len(episodes) > 0:
+                    # 获取第一集URL
+                    first_ep = episodes[0]
+                    if isinstance(first_ep, dict):
+                        url = first_ep.get('url', '')
+                    elif isinstance(first_ep, str):
+                        url = first_ep
+                    else:
+                        continue
+
+                    if url:
+                        ep_count = len(episodes)
+                        # 根据URL确定实际平台
+                        detected_provider = self._detect_provider_from_url(url)
+                        if detected_provider:
+                            supported_providers[detected_provider] = ep_count
+                            self.logger.debug(f"360探测: {title} - {site} 平台 -> 实际平台: {detected_provider} ({ep_count}集)")
+                        else:
+                            # 如果无法从URL检测,使用360的平台映射
+                            if site in provider_reverse_map:
+                                supported_providers[provider_reverse_map[site]] = ep_count
+                                self.logger.debug(f"360探测: {title} - {site} 平台 (使用默认映射, {ep_count}集)")
+            except Exception as e:
+                self.logger.debug(f"360探测: {title} - {site} 平台获取失败: {e}")
+                continue
+
+        self.logger.debug(f"360探测完成: {title} 支持的平台: {supported_providers}")
+        return supported_providers
+
+    def _detect_provider_from_url(self, url: str) -> Optional[str]:
+        """根据URL检测实际平台"""
+        if not url:
+            return None
+        url_lower = url.lower()
+        if 'youku.com' in url_lower:
+            return 'youku'
+        elif 'bilibili.com' in url_lower:
+            return 'bilibili'
+        elif 'qq.com' in url_lower or 'v.qq.com' in url_lower:
+            return 'tencent'
+        elif 'iqiyi.com' in url_lower:
+            return 'iqiyi'
+        elif 'mgtv.com' in url_lower or 'hunantv.com' in url_lower:
+            return 'mgtv'
+        return None
+
+    async def _match_supplement_items(
+        self,
+        keyword: str,
+        providers_to_supplement: Set[str],
+        provider_platforms_map: Dict[str, List[str]],
+        user: models.User
+    ) -> List[models.ProviderSearchInfo]:
+        """360补充源实现：通过360聚合数据的 playlinks 判断哪些平台有数据。"""
+        self.logger.debug(f"360补充搜索: 尝试为 {providers_to_supplement} 补全 '{keyword}'")
+
+        try:
+            search_results = await self.search(keyword, user)
+        except Exception as e:
+            self.logger.warning(f"360补充搜索失败: {e}")
+            return []
+
+        if not search_results:
+            return []
+
+        supplement_items: List[models.ProviderSearchInfo] = []
+
+        for so360_item in search_results:
+            if not so360_item.extra or 'item_data' not in so360_item.extra:
+                continue
+            item_data = so360_item.extra['item_data']
+            playlinks = item_data.get('playlinks', {}) if isinstance(item_data, dict) else {}
+            # 从探测结果中获取各平台的集数
+            provider_ep_counts = so360_item.extra.get('provider_episode_counts', {})
+
+            for provider_name in providers_to_supplement:
+                # 一个 provider 可能对应多个 360 平台 key（如 bilibili/bilibili1），逐一检查
+                platform_keys = provider_platforms_map.get(provider_name, [])
+                matched_key = next((k for k in platform_keys if k in playlinks), None)
+                if matched_key:
+                    media_id = f"sup_{self.provider_name}_{so360_item.id}_{matched_key}"
+                    # 从探测结果获取集数，如果没有探测过则为 None
+                    ep_count = provider_ep_counts.get(provider_name)
+                    supplement_items.append(models.ProviderSearchInfo(
+                        provider=provider_name,
+                        mediaId=media_id,
+                        title=so360_item.title,
+                        type=so360_item.type or 'tv_series',
+                        season=1,
+                        year=so360_item.year,
+                        imageUrl=so360_item.imageUrl,
+                        episodeCount=ep_count,
+                        supportsEpisodeUrls=True,
+                    ))
+
+        return supplement_items
+
     async def search_aliases(self, keyword: str, user: models.User) -> Set[str]:
         search_results = await self.search(keyword, user)
         aliases: Set[str] = set()
@@ -729,16 +1068,17 @@ class So360MetadataSource(BaseMetadataSource):
                 aliases.update(item.aliasesCn)
         return {alias for alias in aliases if alias}
 
-    async def check_connectivity(self) -> str:
+    async def check_connectivity(self) -> Dict[str, str]:
         """检查360源配置状态"""
         # 360源不需要特殊配置，只要Cookie和Headers正确即可
         if self.cookies and self.headers:
-            return "配置正常"
+            return {"code": "ok", "message": "配置正常"}
         else:
-            return "配置异常 (缺少必要的Cookie或Headers)"
+            return {"code": "error", "message": "配置异常 (缺少必要的Cookie或Headers)"}
             
     async def execute_action(self, action_name: str, payload: Dict[str, Any], user: models.User, request: Any) -> Any:
         raise NotImplementedError(f"操作 '{action_name}' 在 {self.provider_name} 中未实现。")
 
     async def close(self):
-        await self.client.aclose()
+        if self.client:
+            await self.client.aclose()

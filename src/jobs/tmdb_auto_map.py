@@ -7,18 +7,47 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy import select
 import httpx
 
-from .. import crud, models
+from src.db import crud, models
+from src.services.alias_service import extract_aliases_from_details, validate_aliases_with_ai
 from .base import BaseJob
-from ..rate_limiter import RateLimiter
-from ..task_manager import TaskManager, TaskSuccess
-from ..scraper_manager import ScraperManager
-from ..metadata_manager import MetadataSourceManager
-from ..ai_matcher_manager import AIMatcherManager
+from src.rate_limiter import RateLimiter
+from src.services import TaskManager, TaskSuccess, ScraperManager, MetadataSourceManager
+from src.ai import AIMatcherManager
+from src.ai.ai_prompts import DEFAULT_AI_MATCH_PROMPT, DEFAULT_AI_RECOGNITION_PROMPT, DEFAULT_AI_ALIAS_VALIDATION_PROMPT
+from src.utils.task_profiler import profile_flow, FLOW_TMDB_AUTO_SCRAPE
 
 class TmdbAutoMapJob(BaseJob):
     job_type = "tmdbAutoScrape"
     job_name = "TMDB自动刮削与剧集组映射"
+    job_name_en = "TMDB Auto-Scrape & Episode Group Mapping"
+    job_name_tw = "TMDB自動刮削與劇集組對映"
     description = "自动从TMDB刮削已导入作品的别名、剧集组信息，更新分集映射关系。帮助解决分集顺序不一致的问题。"
+    description_en = "Auto-scrape aliases and episode group info from TMDB for imported works, updating episode mappings. Helps resolve episode order inconsistencies."
+    description_tw = "自動從TMDB刮削已匯入作品的別名、劇集組資訊，更新分集對映關係。幫助解決分集順序不一致的問題。"
+    config_schema = [
+        {
+            "key": "forceScrape",
+            "label": "强制刮削",
+            "label_en": "Force Scrape",
+            "label_tw": "強制刮削",
+            "type": "boolean",
+            "description": "关闭时，已有剧集组映射的条目将被跳过；开启时，强制覆盖所有条目的刮削数据",
+            "description_en": "When off, entries with existing episode group mappings are skipped; when on, force overwrite all entries.",
+            "description_tw": "關閉時，已有劇集組對映的條目將被跳過；開啟時，強制覆蓋所有條目的刮削資料",
+            "default": False,
+        },
+        {
+            "key": "enableEpisodeGroup",
+            "label": "剧集组刮削",
+            "label_en": "Episode Group Scraping",
+            "label_tw": "劇集組刮削",
+            "type": "boolean",
+            "description": "开启后将从TMDB获取剧集组信息并更新分集映射关系；关闭时仅刮削别名信息",
+            "description_en": "When enabled, fetches episode group info from TMDB and updates mappings; when disabled, only scrapes alias info.",
+            "description_tw": "開啟後將從TMDB取得劇集組資訊並更新分集對映關係；關閉時僅刮削別名資訊",
+            "default": False,
+        },
+    ]
 
     # 修正：此任务不涉及弹幕下载，因此移除不必要的 rate_limiter 依赖
     # 修正：接收正确的依赖项
@@ -32,21 +61,30 @@ class TmdbAutoMapJob(BaseJob):
         self.logger = logging.getLogger(self.__class__.__name__)
 
 
-    async def run(self, session: AsyncSession, progress_callback: Callable):
+    @profile_flow(FLOW_TMDB_AUTO_SCRAPE)
+    async def run(self, session: AsyncSession, progress_callback: Callable, task_config: dict = None):
         """
         定时任务的核心逻辑。
         1. 获取所有TV系列作品
         2. 对于没有TMDB ID的作品，通过标题搜索TMDB获取ID
         3. 刮削别名信息
         4. 获取并映射剧集组信息
+
+        Args:
+            task_config: 任务实例级配置字典，包含 forceScrape 等选项。
         """
-        self.logger.info(f"开始执行 [{self.job_name}] 定时任务...")
+        if task_config is None:
+            task_config = {}
+        force_scrape = task_config.get("forceScrape", False)
+        enable_episode_group = task_config.get("enableEpisodeGroup", False)
+        self.logger.info(f"开始执行 [{self.job_name}] 定时任务... (强制刮削: {'开启' if force_scrape else '关闭'}, 剧集组刮削: {'开启' if enable_episode_group else '关闭'})")
         await progress_callback(0, "正在初始化...")
 
         # 为元数据管理器调用创建一个虚拟用户对象
         user = models.User(id=0, username="scheduled_task")
 
-        # 初始化AI matcher (如果启用)
+        # 【性能优化】AI初始化预热：如果AI已启用，提前开始初始化（不阻塞）
+        ai_matcher_warmup_task = None
         ai_matcher = None
         ai_recognition_enabled = False
         ai_alias_correction_enabled = False
@@ -61,22 +99,36 @@ class TmdbAutoMapJob(BaseJob):
                     self.logger.info("AI别名修正已启用")
 
                 # 动态注册AI提示词配置(如果不存在则创建,使用硬编码默认值)
-                from ..ai_matcher import DEFAULT_AI_MATCH_PROMPT, DEFAULT_AI_RECOGNITION_PROMPT, DEFAULT_AI_ALIAS_VALIDATION_PROMPT
                 await crud.initialize_configs(session, {
                     "aiMatchPrompt": (DEFAULT_AI_MATCH_PROMPT, "AI智能匹配提示词"),
                     "aiRecognitionPrompt": (DEFAULT_AI_RECOGNITION_PROMPT, "AI辅助识别提示词"),
                     "aiAliasValidationPrompt": (DEFAULT_AI_ALIAS_VALIDATION_PROMPT, "AI别名验证提示词")
                 })
 
-                # 使用AIMatcherManager获取matcher实例
-                ai_matcher = await self.ai_matcher_manager.get_matcher()
-                if not ai_matcher:
-                    self.logger.warning("AI匹配器初始化失败,将使用传统搜索")
+                # 【性能优化】启动AI匹配器预热任务（并行）
+                ai_matcher_warmup_task = asyncio.create_task(self.ai_matcher_manager.get_matcher())
+                self.logger.debug("TMDB自动映射 AI匹配器预热已启动（并行）")
         except Exception as e:
             self.logger.warning(f"初始化AI matcher失败: {e}, 将使用传统搜索")
 
-        # 获取所有作品(TV系列和电影/剧场版)
-        from ..orm_models import Anime, AnimeMetadata
+        # 获取所有作品(TV系列和电影/剧场版)，同时带出别名信息用于增量跳过判断
+        from src.db.orm_models import Anime, AnimeMetadata, AnimeAlias
+        from sqlalchemy import func, case, or_
+        # 子查询：检查是否存在任意非空别名
+        has_alias_subq = (
+            select(
+                AnimeAlias.animeId,
+                case(
+                    (or_(
+                        AnimeAlias.nameEn.isnot(None),
+                        AnimeAlias.nameJp.isnot(None),
+                        AnimeAlias.aliasCn1.isnot(None),
+                    ), True),
+                    else_=False
+                ).label("hasAlias")
+            )
+            .subquery()
+        )
         stmt = (
             select(
                 Anime.id.label("animeId"),
@@ -84,9 +136,11 @@ class TmdbAutoMapJob(BaseJob):
                 Anime.year,
                 Anime.type,
                 AnimeMetadata.tmdbId,
-                AnimeMetadata.tmdbEpisodeGroupId
+                AnimeMetadata.tmdbEpisodeGroupId,
+                func.coalesce(has_alias_subq.c.hasAlias, False).label("hasAlias")
             )
             .outerjoin(AnimeMetadata, Anime.id == AnimeMetadata.animeId)
+            .outerjoin(has_alias_subq, Anime.id == has_alias_subq.c.animeId)
             .where(Anime.type.in_(['tv_series', 'movie']))
         )
         result = await session.execute(stmt)
@@ -99,6 +153,7 @@ class TmdbAutoMapJob(BaseJob):
         processed_count = 0
         scraped_count = 0
         mapped_count = 0
+        skipped_count = 0
 
         for i, show in enumerate(shows_to_update):
             current_progress = 5 + int((i / total_shows) * 95) if total_shows > 0 else 95
@@ -111,6 +166,21 @@ class TmdbAutoMapJob(BaseJob):
             self.logger.info(f"正在处理: '{title}' (Anime ID: {anime_id}, TMDB ID: {tmdb_id or '无'})")
 
             try:
+                # 非强制刮削模式下，增量跳过已有完整数据的条目：
+                # - 已有 TMDB ID + 已有别名 + (未开启剧集组 或 已有剧集组) → 跳过
+                existing_group_id = show.get('tmdbEpisodeGroupId')
+                has_alias = show.get('hasAlias', False)
+                if not force_scrape and tmdb_id and has_alias:
+                    # 如果不需要剧集组，或者已有剧集组，则完全跳过
+                    if not enable_episode_group or existing_group_id:
+                        skip_reason = "已有TMDB ID和别名"
+                        if existing_group_id:
+                            skip_reason += f"和剧集组({existing_group_id})"
+                        self.logger.debug(f"增量跳过 '{title}': {skip_reason}")
+                        skipped_count += 1
+                        processed_count += 1
+                        continue
+
                 # 初始化变量
                 use_episode_group = False
                 recognized_season = None
@@ -123,6 +193,13 @@ class TmdbAutoMapJob(BaseJob):
                         # 使用AI标准化标题 (如果启用)
                         search_title = title
                         search_year = year
+
+                        # 【性能优化】第一次使用AI时，await预热task
+                        if ai_matcher_warmup_task and not ai_matcher:
+                            ai_matcher = await ai_matcher_warmup_task
+                            ai_matcher_warmup_task = None  # 清空task，避免重复await
+                            if not ai_matcher:
+                                self.logger.warning("AI匹配器初始化失败,将使用传统搜索")
 
                         if ai_matcher and ai_recognition_enabled:
                             try:
@@ -154,6 +231,15 @@ class TmdbAutoMapJob(BaseJob):
                                     self.logger.info(f"AI标准化: '{title}' → '{search_title}' (year={search_year}, type={search_type})")
                             except Exception as e:
                                 self.logger.warning(f"AI标准化失败: {e}, 使用原标题搜索")
+
+                        # 后备：如果AI未启用或AI未识别到季度，尝试用正则提取季度信息并清理标题
+                        if recognized_season is None:
+                            from src.utils import parse_search_keyword
+                            parsed = parse_search_keyword(search_title)
+                            if parsed.get("season") is not None:
+                                recognized_season = parsed["season"]
+                                search_title = parsed["title"]
+                                self.logger.info(f"正则提取季度: '{title}' → '{search_title}' (season={recognized_season})")
 
                         # 根据类型选择mediaType
                         media_type = "movie" if search_type == "movie" else "tv"
@@ -234,11 +320,49 @@ class TmdbAutoMapJob(BaseJob):
                             await session.commit()
                             scraped_count += 1
                         else:
-                            self.logger.warning(f"未能为 '{title}' 找到TMDB搜索结果。")
-                            continue
+                            # 回退策略: 如果检测到季度信息，尝试从数据库中同系列作品继承TMDB ID
+                            if recognized_season is not None:
+                                base_title = search_title  # 已被 parse_search_keyword 或 AI 清理过的基础标题
+                                self.logger.info(f"TMDB搜索无结果，尝试从同系列作品继承TMDB ID (基础标题: '{base_title}')")
+                                sibling_stmt = (
+                                    select(AnimeMetadata.tmdbId)
+                                    .join(Anime, Anime.id == AnimeMetadata.animeId)
+                                    .where(
+                                        Anime.title.like(f"{base_title}%"),
+                                        AnimeMetadata.tmdbId.isnot(None),
+                                        AnimeMetadata.tmdbId != "",
+                                        Anime.type == 'tv_series'
+                                    )
+                                    .limit(1)
+                                )
+                                sibling_result = await session.execute(sibling_stmt)
+                                inherited_tmdb_id = sibling_result.scalar_one_or_none()
+
+                                if inherited_tmdb_id:
+                                    tmdb_id = inherited_tmdb_id
+                                    self.logger.info(f"从同系列作品继承TMDB ID: '{title}' → TMDB ID: {tmdb_id}")
+                                    await crud.update_metadata_if_empty(session, anime_id, tmdb_id=tmdb_id)
+                                    await session.commit()
+                                    scraped_count += 1
+                                else:
+                                    self.logger.warning(f"未能为 '{title}' 找到TMDB搜索结果，也未找到同系列作品的TMDB ID。")
+                                    continue
+                            else:
+                                self.logger.warning(f"未能为 '{title}' 找到TMDB搜索结果。")
+                                continue
                     except Exception as e:
                         self.logger.error(f"搜索 '{title}' 时发生错误: {e}")
+                        await session.rollback()
                         continue
+
+                # 步骤 1.5: 对于已有TMDB ID的作品，也需要识别季度信息
+                # （搜索分支内的AI识别和正则提取只在没有TMDB ID时执行）
+                if recognized_season is None:
+                    from src.utils import parse_search_keyword
+                    parsed = parse_search_keyword(title)
+                    if parsed.get("season") is not None:
+                        recognized_season = parsed["season"]
+                        self.logger.info(f"正则提取季度(已有TMDB ID): '{title}' → season={recognized_season}")
 
                 # 步骤 2: 获取媒体详情，包括别名
                 # 根据作品类型决定mediaType参数
@@ -249,74 +373,42 @@ class TmdbAutoMapJob(BaseJob):
                     continue
 
                 # 步骤 3: 准备别名（暂不更新到数据库，等待剧集组识别后可能需要追加季度后缀）
-                # 注意: 电影类型不使用AI验证别名,因为电影标题通常包含系列名+副标题
-                # 例如"名侦探柯南 绀碧之棺",AI可能无法正确识别属于该电影的别名
-                # TV系列可以使用AI验证,因为标题通常是系列名
-
-                # 用于保存别名的变量，后续可能会追加季度后缀
-                aliases_to_update = None
+                aliases_to_update = extract_aliases_from_details(details)
                 force_update = False
 
-                if ai_matcher and ai_recognition_enabled and search_type == "tv_series":
-                    # 仅对TV系列使用AI验证别名
-                    # 收集所有别名
-                    all_aliases = []
-                    if details.nameEn: all_aliases.append(details.nameEn)
-                    if details.nameJp: all_aliases.append(details.nameJp)
-                    if details.nameRomaji: all_aliases.append(details.nameRomaji)
-                    if details.aliasesCn: all_aliases.extend(details.aliasesCn)
+                if ai_matcher and ai_recognition_enabled and search_type == "tv_series" and aliases_to_update:
+                    aliases_to_update, force_update = await validate_aliases_with_ai(
+                        title, year, search_type, aliases_to_update, ai_matcher, ai_alias_correction_enabled
+                    )
 
-                    if all_aliases:
-                        self.logger.info(f"正在使用AI验证 '{title}' 的 {len(all_aliases)} 个别名...")
-                        validated_aliases = ai_matcher.validate_aliases(
-                            title=title,
-                            year=year,
-                            anime_type=search_type,
-                            aliases=all_aliases
-                        )
-
-                        if validated_aliases:
-                            # 使用AI验证后的别名
-                            aliases_to_update = {
-                                "name_en": validated_aliases.get("nameEn"),
-                                "name_jp": validated_aliases.get("nameJp"),
-                                "name_romaji": validated_aliases.get("nameRomaji"),
-                                "aliases_cn": validated_aliases.get("aliasesCn", [])
-                            }
-                            # 如果启用了AI别名修正,则强制更新
-                            force_update = ai_alias_correction_enabled
-                            self.logger.info(f"AI别名验证成功，准备更新 '{title}' 的别名")
-                        else:
-                            self.logger.warning(f"AI别名验证失败,使用原始别名")
-                            # 降级到原始别名
-                            aliases_to_update = {
-                                "name_en": details.nameEn,
-                                "name_jp": details.nameJp,
-                                "name_romaji": details.nameRomaji,
-                                "aliases_cn": details.aliasesCn
-                            }
-                else:
-                    # 电影类型或未启用AI,直接使用原始别名
-                    aliases_to_update = {
-                        "name_en": details.nameEn,
-                        "name_jp": details.nameJp,
-                        "name_romaji": details.nameRomaji,
-                        "aliases_cn": details.aliasesCn
-                    }
+                # 步骤 3.5: 如果识别到季度>=2，为中文别名追加季度后缀
+                # 无论是否开启剧集组刮削，都需要确保别名与标题中的季度信息一致
+                if recognized_season is not None and recognized_season >= 2 and aliases_to_update:
+                    season_suffix = f" 第{recognized_season}季"
+                    if aliases_to_update.get("aliases_cn"):
+                        updated_cn_aliases = []
+                        for cn_alias in aliases_to_update["aliases_cn"]:
+                            if cn_alias and not cn_alias.endswith(season_suffix):
+                                updated_cn_aliases.append(cn_alias + season_suffix)
+                            else:
+                                updated_cn_aliases.append(cn_alias)
+                        aliases_to_update["aliases_cn"] = updated_cn_aliases
+                        self.logger.info(f"为 '{title}' 的中文别名追加季度后缀: {season_suffix}")
 
                 # 步骤 4: 智能季度匹配 - 两级查找逻辑 (仅适用于TV系列)
                 # 第一级: 使用seasons信息进行匹配(方案A)
                 # 第二级: 使用"Seasons"剧集组进行匹配(方案C)
 
-                # 电影类型跳过剧集组处理，直接更新别名
-                if show.get('type') == 'movie':
-                    self.logger.info(f"'{title}' 是电影类型,跳过剧集组处理。")
+                # 电影类型或未开启剧集组刮削时，跳过剧集组处理，直接更新别名
+                if show.get('type') == 'movie' or not enable_episode_group:
+                    skip_reason = "电影类型" if show.get('type') == 'movie' else "未开启剧集组刮削"
+                    self.logger.info(f"'{title}' {skip_reason}，跳过剧集组处理。")
                     # 更新别名到数据库
                     if aliases_to_update and any(aliases_to_update.values()):
                         updated_fields = await crud.update_anime_aliases_if_empty(session, anime_id, aliases_to_update, force_update=force_update)
                         if updated_fields:
                             mode_str = "(AI修正模式)" if force_update else ""
-                            self.logger.info(f"为电影 '{title}' 更新了别名{mode_str}: {', '.join(updated_fields)}")
+                            self.logger.info(f"为 '{title}' 更新了别名{mode_str}: {', '.join(updated_fields)}")
                     await session.commit()
                     processed_count += 1
                     continue
@@ -391,6 +483,14 @@ class TmdbAutoMapJob(BaseJob):
 
                     if not all_groups:
                         self.logger.info(f"'{title}' (TMDB ID: {tmdb_id}) 没有找到任何剧集组。")
+                        # 即使没有剧集组，也要更新别名
+                        if aliases_to_update and any(aliases_to_update.values()):
+                            updated_fields = await crud.update_anime_aliases_if_empty(session, anime_id, aliases_to_update, force_update=force_update)
+                            if updated_fields:
+                                mode_str = "(AI修正模式)" if force_update else ""
+                                self.logger.info(f"为 '{title}' 更新了别名{mode_str}: {', '.join(updated_fields)}")
+                        await session.commit()
+                        processed_count += 1
                         continue
 
                     self.logger.info(f"为 '{title}' 找到 {len(all_groups)} 个剧集组: {[g.get('name') for g in all_groups]}")
@@ -423,7 +523,7 @@ class TmdbAutoMapJob(BaseJob):
                     await session.commit()
                     processed_count += 1
                     continue
-                
+
                 self.logger.info(f"为 '{title}' 选择了 {len(groups_to_process)} 个剧集组进行映射更新。")
 
                 # 步骤 5: 为每个选定的剧集组，更新映射表
@@ -485,6 +585,7 @@ class TmdbAutoMapJob(BaseJob):
                 await asyncio.sleep(1) # 简单的速率限制，防止对TMDB API造成过大压力
 
         self.logger.info(f"定时任务 [{self.job_name}] 执行完毕。")
-        self.logger.info(f"统计: 共处理 {processed_count}/{total_shows} 个作品, 刮削 {scraped_count} 个TMDB ID, 映射 {mapped_count} 个剧集组。")
+        skip_info = f", 跳过 {skipped_count} 个已有数据" if skipped_count > 0 else ""
+        self.logger.info(f"统计: 共处理 {processed_count}/{total_shows} 个作品, 刮削 {scraped_count} 个TMDB ID, 映射 {mapped_count} 个剧集组{skip_info}。")
         # 修正：抛出 TaskSuccess 异常，以便 TaskManager 可以用一个有意义的消息来结束任务
-        raise TaskSuccess(f"任务执行完毕，共处理 {processed_count}/{total_shows} 个作品, 刮削 {scraped_count} 个TMDB ID, 映射 {mapped_count} 个剧集组。")
+        raise TaskSuccess(f"任务执行完毕，共处理 {processed_count}/{total_shows} 个作品, 刮削 {scraped_count} 个TMDB ID, 映射 {mapped_count} 个剧集组{skip_info}。")

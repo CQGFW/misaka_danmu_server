@@ -1,5 +1,6 @@
 import { getSearchResult, clearSearchCache } from '../../../apis'
 import { useEffect, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import {
   Button,
   Checkbox,
@@ -18,8 +19,10 @@ import {
 } from '../../../../store'
 import { useModal } from '../../../ModalContext'
 import { useMessage } from '../../../MessageContext'
+import { useSearchParams } from 'react-router-dom'
 
 export const SearchBar = () => {
+  const { t } = useTranslation()
   const [loading, setLoading] = useAtom(searchLoadingAtom)
   const [cacheLoading, setCacheLoading] = useState(false)
   const [form] = Form.useForm()
@@ -40,10 +43,23 @@ export const SearchBar = () => {
   const modalApi = useModal()
   const messageApi = useMessage()
 
+  // 从 URL 参数读取 keyword 并自动填入
+  const [searchParams, setSearchParams] = useSearchParams()
+  const initialKeywordRef = useRef(false)
+  useEffect(() => {
+    const urlKeyword = searchParams.get('keyword')
+    if (urlKeyword && !initialKeywordRef.current) {
+      initialKeywordRef.current = true
+      form.setFieldValue('keyword', urlKeyword)
+      // 清除 URL 参数，避免刷新后重复触发
+      setSearchParams({}, { replace: true })
+    }
+  }, [searchParams, form, setSearchParams])
+
   const onInsert = () => {
     if (!season) {
       messageApi.destroy()
-      messageApi.error('请输入季数')
+      messageApi.error(t('home.inputSeason'))
       return
     }
     let formatted = ` S${String(season).padStart(2, '0')}`
@@ -53,7 +69,7 @@ export const SearchBar = () => {
     form.setFieldValue('keyword', `${keyword}${formatted}`)
   }
 
-  const onSearch = async values => {
+  const onSearch = async (values, page = 1, pageSize = 10) => {
     try {
       if (loading) return
       setLoading(true)
@@ -69,6 +85,8 @@ export const SearchBar = () => {
       const res = await getSearchResult(
         {
           keyword: values.keyword,
+          page,
+          pageSize,
         },
         onProgress
       )
@@ -98,26 +116,26 @@ export const SearchBar = () => {
 
   const onClearCache = () => {
     modalApi.confirm({
-      title: '清除缓存',
+      title: t('home.clearCacheTitle'),
       zIndex: 1002,
       content: (
         <div>
-          您确定要清除所有缓存吗？
+          {t('home.clearCacheContent')}
           <br />
-          这将清除所有搜索结果和分集列表的临时缓存，下次访问时需要重新从网络获取。
+          {t('home.clearCacheDesc')}
         </div>
       ),
-      okText: '确认',
-      cancelText: '取消',
+      okText: t('common.confirm'),
+      cancelText: t('common.cancel'),
       onOk: async () => {
         try {
           setCacheLoading(true)
           const res = await clearSearchCache()
           messageApi.destroy()
-          messageApi.success(res.data.message || '缓存已成功清除！')
+          messageApi.success(res.data.message || t('home.cacheCleared'))
         } catch (err) {
           messageApi.destroy()
-          messageApi.error(`清除缓存失败: ${error.message || error}`)
+          messageApi.error(`${t('home.clearCacheFailed')}: ${err.message || err}`)
         } finally {
           setCacheLoading(false)
         }
@@ -134,9 +152,9 @@ export const SearchBar = () => {
   return (
     <div>
       <div className="flex items-center justify-between mb-4">
-        <div className="text-lg font-semibold">搜索番剧</div>
+        <div className="text-lg font-semibold">{t('home.searchAnime')}</div>
         <Button type="primary" loading={cacheLoading} onClick={onClearCache}>
-          清除缓存
+          {t('home.clearCache')}
         </Button>
       </div>
 
@@ -145,14 +163,18 @@ export const SearchBar = () => {
           <Form.Item
             name="keyword"
             className="flex-1 mb-0"
-            rules={[{ required: true, message: '请输入番剧名称' }]}
+            rules={[{ required: true, message: t('home.inputAnimeName') }]}
           >
             <Input.Search
-              placeholder="请输入番剧名称"
-              size="large"
-              enterButton="搜索"
+              placeholder={t('home.inputAnimeName')}
+              enterButton={t('home.search')}
               loading={loading}
-              onSearch={() => form.submit()}
+              onSearch={value => {
+                if (value) {
+                  form.setFieldValue('keyword', value)
+                  form.submit()
+                }
+              }}
             />
           </Form.Item>
         </div>
@@ -163,31 +185,35 @@ export const SearchBar = () => {
           </div>
         )}
 
-        <div className="flex items-center gap-3 flex-wrap">
+        <div className={`flex items-center ${isMobile ? 'gap-2' : 'gap-3 flex-wrap'}`}>
           <Checkbox
             checked={exactSearch}
             onChange={e => setExactSearch(e.target.checked)}
           >
-            精确搜索
+            {isMobile ? <span>{t('home.exact')}<br />{t('home.search')}</span> : t('home.exactSearch')}
           </Checkbox>
 
-          {exactSearch && (
-            <>
-              <Form.Item name="season" label="季" className="mb-0">
-                <InputNumber min={0} placeholder="季数" style={{ width: 80 }} />
+          <div className={`flex items-center ${isMobile ? 'gap-2' : 'gap-3'}`}>
+            <div className="flex items-center gap-1">
+              <span className={`leading-8 ${exactSearch ? '' : 'text-gray-400'}`}>{t('home.season')}</span>
+              <Form.Item name="season" noStyle>
+                <InputNumber min={0} placeholder={t('home.season')} disabled={!exactSearch} style={{ width: 80 }} />
               </Form.Item>
-              <Form.Item name="episode" label="集" className="mb-0">
-                <InputNumber min={1} placeholder="集数" disabled={!season} style={{ width: 80 }} />
+            </div>
+            <div className="flex items-center gap-1">
+              <span className={`leading-8 ${exactSearch ? '' : 'text-gray-400'}`}>{t('home.episode')}</span>
+              <Form.Item name="episode" noStyle>
+                <InputNumber min={1} placeholder={t('home.episode')} disabled={!exactSearch || !season} style={{ width: 80 }} />
               </Form.Item>
-              <Button type="primary" onClick={onInsert} size="small">
-                插入
-              </Button>
-              {!isMobile && (
-                <span className="text-xs text-gray-500">
-                  填写季、集后可插入到名称中
-                </span>
-              )}
-            </>
+            </div>
+            <Button type="primary" onClick={onInsert} size="small" disabled={!exactSearch}>
+              {t('home.insert')}
+            </Button>
+          </div>
+          {!isMobile && (
+            <span className={`text-xs ${exactSearch ? 'text-gray-500' : 'text-gray-300'}`}>
+              {t('home.insertTip')}
+            </span>
           )}
         </div>
       </Form>

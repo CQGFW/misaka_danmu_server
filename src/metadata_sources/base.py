@@ -1,30 +1,94 @@
 from abc import ABC, abstractmethod
 import logging
-from typing import Any, Dict, List, Optional, Set, Type,Tuple
+from typing import Any, Dict, List, Optional, Set
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker # type: ignore
 from fastapi import Request
 from httpx import HTTPStatusError
 
-from .. import models
-from ..config_manager import ConfigManager
-from ..scraper_manager import ScraperManager
+from src.db import models, ConfigManager, CacheManager
+from src.services import ScraperManager
 
 class BaseMetadataSource(ABC):
     """所有元数据源插件的抽象基类。"""
 
     # 每个子类必须定义自己的提供商名称
     provider_name: str
-    # 新增：声明可配置字段 { "db_key": ("UI标签", "类型", "提示") }
-    configurable_fields: Dict[str, Tuple[str, str, str]] = {}
+    # 用户可配置的 config key 列表，子类自行声明
+    # API 层的 GET/PUT 配置接口会自动读写这些 key，无需在 API 层硬编码
+    config_keys: List[str] = []
+    # 布尔类型的 config key（存储为字符串 "true"/"false"，读取时自动转换）
+    bool_config_keys: List[str] = []
+    # 声明可配置字段；兼容旧元组格式与包含 label/type/tooltip/default 等属性的字典格式。
+    configurable_fields: Dict[str, Any] = {}
     # 新增：是否支持获取分集URL (用于补充源功能)
     supports_episode_urls: bool = False
+    # 新增：是否为搜索补充源（当弹幕源搜索无结果时，可为对应平台提供兜底数据）
+    is_search_supplement_source: bool = False
+    # 补充源平台映射：内部平台名 → 弹幕源 provider name
+    # 子类覆盖此字典即可声明支持哪些平台的补充
+    # 例如: {"qq": "tencent", "bilibili1": "bilibili", "qiyi": "iqiyi"}
+    PLATFORM_TO_PROVIDER: Dict[str, str] = {}
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], config_manager: ConfigManager, scraper_manager: ScraperManager):
+    # ============ 订阅助手能力（与 BaseScraper 同款契约） ============
+    # 默认 supports_subscription=False，不影响现有元数据源；声明 True 的源（如 Trakt/Bangumi）
+    # 在订阅页搜索栏可被搜到并创建订阅目标，由 IncrementalRefreshJob 走 auto_import 整体导入。
+    supports_subscription: bool = False
+
+    # 该源支持的订阅类型（例如 [{"type": "trakt_show", "label": "影视剧", ...}]）
+    subscription_types: List[Dict[str, Any]] = []
+
+    # URL 域名列表（前端 URL 订阅按钮按域名定位 provider）
+    handled_domains: List[str] = []
+
+    async def check_subscription_capability(self, user=None) -> Dict[str, Any]:
+        """返回该源订阅能力状态。子类按需覆盖。默认不支持。
+
+        :param user: 可选用户对象（OAuth 类源用它判断授权状态）。
+        """
+        return {
+            "available": False,
+            "authRequired": False,
+            "authStatus": "none",
+            "reason": "该源未实现订阅能力",
+            "subscriptionTypes": [],
+        }
+
+    async def discover_subscription_targets(self, query: str, subscription_type: str = "", user=None) -> List[Dict[str, Any]]:
+        """按 query 发现可订阅候选；子类在支持订阅时覆盖。
+
+        :param user: 可选用户对象（OAuth 类源用它取 token/api-key）。
+        """
+        raise NotImplementedError(f"{self.provider_name} 未实现 discover_subscription_targets")
+
+    async def validate_subscription_payload(self, subscription_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """校验并标准化订阅 payload，返回 {provider, externalId, title, animeType, subscriptionType, extraData}。"""
+        raise NotImplementedError(f"{self.provider_name} 未实现 validate_subscription_payload")
+
+    async def scan_subscription_target(self, target: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """扫描订阅目标。元数据源订阅(整剧导入)默认返回空列表，由 IncrementalRefreshJob 处理。"""
+        return []
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], config_manager: ConfigManager, scraper_manager: ScraperManager, cache_manager: CacheManager):
         self._session_factory = session_factory
         self.config_manager = config_manager
         self.scraper_manager = scraper_manager
+        self.cache_manager = cache_manager
         self.logger = logging.getLogger(self.__class__.__name__)
+
+    @classmethod
+    def _build_provider_to_platforms(cls) -> Dict[str, List[str]]:
+        """反转 PLATFORM_TO_PROVIDER 映射：弹幕源 provider → [内部平台名列表]
+
+        例如 {"qq": "tencent", "bilibili1": "bilibili"}
+        → {"tencent": ["qq"], "bilibili": ["bilibili1"]}
+
+        子类通常不需要覆盖此方法，直接使用即可。
+        """
+        result: Dict[str, List[str]] = {}
+        for platform_key, provider in cls.PLATFORM_TO_PROVIDER.items():
+            result.setdefault(provider, []).append(platform_key)
+        return result
 
     @abstractmethod
     async def search(self, keyword: str, user: models.User, mediaType: Optional[str] = None) -> List[models.MetadataDetailsResponse]:
@@ -42,8 +106,11 @@ class BaseMetadataSource(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def check_connectivity(self) -> str:
-        """检查源的配置状态，并返回状态字符串。"""
+    async def check_connectivity(self) -> Dict[str, str]:
+        """检查源的配置状态，并返回状态字典。
+
+        返回格式: {"code": "ok|unconfigured|warning|error|disabled", "message": "..."}
+        """
         raise NotImplementedError
     
     @abstractmethod
@@ -73,6 +140,97 @@ class BaseMetadataSource(ABC):
             List[Tuple[int, str]]: (集数, 播放URL) 的列表
         """
         return [] # 默认实现返回空列表
+
+    async def supplement_search(
+        self,
+        keyword: str,
+        empty_providers: Set[str],
+        user: models.User
+    ) -> List[models.ProviderSearchInfo]:
+        """当弹幕源搜索无结果时，为对应平台提供兜底搜索结果。（模板方法）
+
+        基类统一处理：
+        1. 过滤 empty_providers，只保留有 PLATFORM_TO_PROVIDER 映射的
+        2. 调用子类 _match_supplement_items() 获取原始匹配结果
+        3. 按 mediaId 去重
+        4. 自动填充 supplementSource
+
+        子类需设 is_search_supplement_source = True 并实现 _match_supplement_items()。
+
+        Args:
+            keyword: 搜索关键词
+            empty_providers: 返回0结果的弹幕源名称集合（如 {"youku", "iqiyi"}）
+            user: 系统用户
+
+        Returns:
+            以对应弹幕源 provider 名义生成的 ProviderSearchInfo 列表
+        """
+        if not self.PLATFORM_TO_PROVIDER:
+            return []
+
+        # 1. 过滤：只对有映射关系的空结果源进行补全
+        provider_platforms_map = self._build_provider_to_platforms()
+        providers_to_supplement = {p for p in empty_providers if p in provider_platforms_map}
+        if not providers_to_supplement:
+            return []
+
+        # 2. 调用子类实现获取原始匹配结果
+        raw_items = await self._match_supplement_items(keyword, providers_to_supplement, provider_platforms_map, user)
+        if not raw_items:
+            return []
+
+        # 3. 去重 + 自动填充 supplementSource
+        seen_media_ids: Set[str] = set()
+        final_items: List[models.ProviderSearchInfo] = []
+        for item in raw_items:
+            if item.mediaId not in seen_media_ids:
+                # 确保 supplementSource 统一设置
+                item.supplementSource = self.provider_name
+                final_items.append(item)
+                seen_media_ids.add(item.mediaId)
+
+        if final_items:
+            supplemented_providers = {item.provider for item in final_items}
+            self.logger.debug(f"{self.provider_name}补充搜索: 为 {supplemented_providers} 补全了 {len(final_items)} 个结果")
+
+        return final_items
+
+    async def _match_supplement_items(
+        self,
+        keyword: str,
+        providers_to_supplement: Set[str],
+        provider_platforms_map: Dict[str, List[str]],
+        user: models.User
+    ) -> List[models.ProviderSearchInfo]:
+        """子类实现：根据关键词搜索并匹配可补充的条目。
+
+        基类已完成 provider 过滤和去重，子类只需关注：
+        1. 如何搜索获取候选结果
+        2. 如何判断候选结果支持哪些 provider
+        3. 构建 ProviderSearchInfo 返回（provider 使用弹幕源标准名称）
+
+        Args:
+            keyword: 搜索关键词
+            providers_to_supplement: 需要补充的弹幕源名称集合（已过滤，只含有映射的）
+            provider_platforms_map: 反转映射 {弹幕源名 → [内部平台名列表]}
+            user: 系统用户
+
+        Returns:
+            匹配到的 ProviderSearchInfo 列表（无需去重，基类会处理）
+        """
+        return []
+
+    async def get_calendar(self, user: models.User) -> List[Dict[str, Any]]:
+        """获取该元数据源的日历/日程数据。
+
+        返回条目列表，每个条目至少包含：
+        - title: 标题
+        - airWeekday: 播出星期 (1=周一 ... 7=周日)
+        - origin: 来源标识 (= provider_name)
+        - isLocal: False
+        以及其他可选字段（imageUrl, rating, bangumiId, traktId 等）
+        """
+        return []
 
     async def close(self):
         """关闭所有打开的资源，例如HTTP客户端。"""

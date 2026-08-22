@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from fastapi import HTTPException, status
 from pydantic import BaseModel, ValidationError, field_validator
 
-from .. import crud, models
+from src.db import crud, models
 from .base import BaseMetadataSource, HTTPStatusError
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,7 @@ class DoubanJsonSearchResponse(BaseModel):
 # --- Main Metadata Source Class ---
 class DoubanMetadataSource(BaseMetadataSource): # type: ignore
     provider_name = "douban" # type: ignore
+    config_keys = ["doubanCookie"]
     test_url = "https://movie.douban.com"
     has_force_aux_search_toggle = True # 新增：硬编码标志
     is_failover_source = True
@@ -54,16 +55,28 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
         if cookie:
             headers["Cookie"] = cookie
 
-        proxy_url = await self.config_manager.get("proxyUrl", "")
-        proxy_enabled_globally = (await self.config_manager.get("proxyEnabled", "false")).lower() == 'true'
+        # 获取代理模式
+        proxy_mode = await self.config_manager.get("proxyMode", "none")
 
-        async with self._session_factory() as session:
-            metadata_settings = await crud.get_all_metadata_source_settings(session)
+        # 兼容旧配置：如果 proxyMode 为 none 但 proxyEnabled 为 true，则使用 http_socks 模式
+        if proxy_mode == "none":
+            proxy_enabled_globally = (await self.config_manager.get("proxyEnabled", "false")).lower() == 'true'
+            if proxy_enabled_globally:
+                proxy_mode = "http_socks"
 
-        provider_setting = next((s for s in metadata_settings if s['providerName'] == self.provider_name), None)
-        use_proxy_for_this_provider = provider_setting.get('useProxy', False) if provider_setting else False
+        proxy_to_use = None
 
-        proxy_to_use = proxy_url if proxy_enabled_globally and use_proxy_for_this_provider and proxy_url else None
+        # 只有 http_socks 模式才需要设置 httpx 的 proxy 参数
+        if proxy_mode == "http_socks":
+            proxy_url = await self.config_manager.get("proxyUrl", "")
+            if proxy_url:
+                async with self._session_factory() as session:
+                    metadata_settings = await crud.get_all_metadata_source_settings(session)
+
+                provider_setting = next((s for s in metadata_settings if s['providerName'] == self.provider_name), None)
+                use_proxy_for_this_provider = provider_setting.get('useProxy', False) if provider_setting else False
+
+                proxy_to_use = proxy_url if use_proxy_for_this_provider else None
 
         return httpx.AsyncClient(headers=headers, timeout=20.0, follow_redirects=True, proxy=proxy_to_use)
 
@@ -229,21 +242,22 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
             self.logger.warning(f"豆瓣辅助搜索失败: {e}")
         return {alias for alias in local_aliases if alias}
 
-    async def check_connectivity(self) -> str:
+    async def check_connectivity(self) -> Dict[str, str]:
         """检查豆瓣源配置状态"""
         try:
-            # 检查Cookie配置
+            # 豆瓣Cookie是可选的，没有Cookie也可以正常使用（匿名访问）
+            # 只有被流控或封禁时才需要填Cookie
             douban_cookie = await self.config_manager.get("doubanCookie", "")
             if not douban_cookie or douban_cookie.strip() == "":
-                return "未配置 (缺少豆瓣Cookie)"
+                return {"code": "ok", "message": "配置正常 (匿名访问，被流控时可配置Cookie)"}
 
-            # 检查Cookie格式是否合理
+            # 填了Cookie，检查格式是否合理
             if "bid=" not in douban_cookie and "dbcl2=" not in douban_cookie:
-                return "配置异常 (Cookie格式不正确)"
+                return {"code": "warning", "message": "Cookie已配置但格式可能不正确 (建议检查)"}
 
-            return "配置正常"
+            return {"code": "ok", "message": "配置正常 (已配置Cookie)"}
         except Exception as e:
-            return f"配置检查失败: {e}"
+            return {"code": "error", "message": f"配置检查失败: {e}"}
 
     async def execute_action(self, action_name: str, payload: Dict, user: models.User) -> Any:
         """Douban source does not support custom actions."""

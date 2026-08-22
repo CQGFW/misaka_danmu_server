@@ -1,11 +1,67 @@
-import { Card, Table, Tag, Typography } from 'antd'
+import { Card, Collapse, Empty, Table, Tag, Typography } from 'antd'
 import { useEffect, useState } from 'react'
 import { getControlApiKeyLog } from '../../../apis'
 import dayjs from 'dayjs'
 import { useAtomValue } from 'jotai'
 import { isMobileAtom } from '../../../../store'
+import { useTranslation } from 'react-i18next'
+
+// JSON 格式化：尝试解析并美化，同时解码 Unicode 转义
+const formatContent = (raw) => {
+  if (!raw) return raw
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2)
+  } catch {
+    return raw
+  }
+}
+
+const DetailBlock = ({ label, content }) => {
+  if (!content) return null
+  return (
+    <div className="mb-3">
+      <div className="text-xs font-semibold text-gray-500 dark:text-gray-400 mb-1">{label}</div>
+      <pre className="text-xs bg-gray-50 dark:bg-gray-800 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-[200px] overflow-y-auto m-0">{formatContent(content)}</pre>
+    </div>
+  )
+}
+
+const LogDetailPanel = ({ log, t }) => {
+  const hasRequest = log.requestHeaders || log.requestBody
+  const hasResponse = log.responseHeaders || log.responseBody
+  if (!hasRequest && !hasResponse) {
+    return <div className="text-xs text-gray-400 py-2">{t('control.apiLogsEmpty')}</div>
+  }
+  const items = []
+  if (hasRequest) {
+    items.push({
+      key: 'request',
+      label: t('control.apiLogsRequestInfo'),
+      children: (
+        <div>
+          <DetailBlock label={t('control.apiLogsRequestHeaders')} content={log.requestHeaders} />
+          <DetailBlock label={t('control.apiLogsRequestBody')} content={log.requestBody} />
+        </div>
+      ),
+    })
+  }
+  if (hasResponse) {
+    items.push({
+      key: 'response',
+      label: t('control.apiLogsResponseInfo'),
+      children: (
+        <div>
+          <DetailBlock label={t('control.apiLogsResponseHeaders')} content={log.responseHeaders} />
+          <DetailBlock label={t('control.apiLogsResponseBody')} content={log.responseBody} />
+        </div>
+      ),
+    })
+  }
+  return <Collapse size="small" items={items} />
+}
 
 export const ApiLogs = () => {
+  const { t } = useTranslation()
   const [loading, setLoading] = useState(true)
   const [logs, setLogs] = useState([])
   const isMobile = useAtomValue(isMobileAtom)
@@ -23,7 +79,7 @@ export const ApiLogs = () => {
 
   const columns = [
     {
-      title: '访问时间',
+      title: t('control.apiLogsColumnTime'),
       dataIndex: 'accessTime',
       key: 'accessTime',
       width: 200,
@@ -34,19 +90,19 @@ export const ApiLogs = () => {
       },
     },
     {
-      title: 'IP地址',
+      title: t('control.apiLogsColumnIp'),
       dataIndex: 'ipAddress',
       key: 'ipAddress',
       width: 150,
     },
     {
-      title: '端点',
+      title: t('control.apiLogsColumnEndpoint'),
       dataIndex: 'endpoint',
       key: 'endpoint',
       width: 200,
     },
     {
-      title: '状态码',
+      title: t('control.apiLogsColumnStatusCode'),
       width: 200,
       dataIndex: 'statusCode',
       key: 'statusCode',
@@ -59,7 +115,7 @@ export const ApiLogs = () => {
       },
     },
     {
-      title: '消息',
+      title: t('control.apiLogsColumnMessage'),
       dataIndex: 'message',
       key: 'message',
       width: 400,
@@ -68,9 +124,11 @@ export const ApiLogs = () => {
 
   return (
     <div className="my-6">
-      <Card title="API访问日志" loading={loading}>
-        <div className="mb-4">这里显示最近100条通过外部API的访问记录。</div>
-        {isMobile ? (
+      <Card title={t('control.apiLogsCardTitle')} loading={loading}>
+        <div className="mb-4">{t('control.apiLogsDesc')}</div>
+        {logs.length === 0 && !loading ? (
+          <Empty description={t('control.apiLogsNoRecords')} />
+        ) : isMobile ? (
           <div className="space-y-4">
             {logs.map((log, index) => {
               const isSuccess = log.statusCode < 400;
@@ -101,20 +159,21 @@ export const ApiLogs = () => {
                         </Typography.Text>
                       </div>
                       <div className="flex items-start gap-3">
-                        <span className="text-xs font-medium text-gray-500 dark:text-gray-400 w-8 shrink-0 mt-1">端点:</span>
+                        <span className="text-xs font-medium text-gray-500 dark:text-gray-400 w-8 shrink-0 mt-1">{t('control.apiLogsEndpoint')}:</span>
                         <Typography.Text code className="text-xs break-all flex-1">
                           {log.endpoint}
                         </Typography.Text>
                       </div>
                       {log.message && (
                         <div className="flex items-start gap-3">
-                          <span className="text-xs font-medium text-gray-500 dark:text-gray-400 w-8 shrink-0 mt-1">消息:</span>
+                          <span className="text-xs font-medium text-gray-500 dark:text-gray-400 w-8 shrink-0 mt-1">{t('control.apiLogsMessage')}:</span>
                           <Typography.Text code className="text-xs break-all flex-1">
                             {log.message}
                           </Typography.Text>
                         </div>
                       )}
                     </div>
+                    <LogDetailPanel log={log} t={t} />
                   </div>
                 </Card>
               );
@@ -126,10 +185,14 @@ export const ApiLogs = () => {
             size="small"
             dataSource={logs}
             columns={columns}
-            rowKey={'accessTime'}
+            rowKey={(_, index) => index}
+            expandable={{
+              expandedRowRender: (record) => <LogDetailPanel log={record} t={t} />,
+              rowExpandable: (record) => !!(record.requestHeaders || record.requestBody || record.responseHeaders || record.responseBody),
+            }}
             scroll={{
               x: '100%',
-              y: 400,
+              y: 600,
             }}
           />
         )}
